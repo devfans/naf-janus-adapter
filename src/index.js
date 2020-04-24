@@ -114,18 +114,20 @@ class JanusSession {
     this.peerConnectionConfig = peerConnectionConfig;
   }
 
-  getOrCreatePublisher(room) {
+  async getOrCreatePublisher(room) {
     if (!this._publishers[room.room]) {
-      this._publishers[room.room] = this.createExtraPublisher(room)
+      this._publishers[room.room] = await this.createExtraPublisher(room)
     }
     return this._publishers[room.room]
   }
 
   associate(conn, handle) {
     conn.addEventListener("icecandidate", ev => {
+      // console.log("extra icecandidate");
       handle.sendTrickle(ev.candidate || null).catch(e => error("Error trickling ICE: %o", e));
     });
     conn.addEventListener("iceconnectionstatechange", ev => {
+      // console.log("extra iceconnectionstatechange");
       if (conn.iceConnectionState === "failed") {
         console.warn("ICE failure detected. Reconnecting in 10s.");
         console.error("No reconnect for extra session!");
@@ -140,6 +142,7 @@ class JanusSession {
     conn.addEventListener(
       "negotiationneeded",
       debounce(ev => {
+        // console.log("extra negotiationneeded");
         debug("Sending new offer for handle: %o", handle);
         var offer = conn.createOffer().then(this.configurePublisherSdp).then(this.fixSafariIceUFrag);
         var local = offer.then(o => conn.setLocalDescription(o));
@@ -218,7 +221,9 @@ class JanusSession {
     const websocketConnection = new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.serverUrl, "janus-protocol");
 
+      console.log("Init extra session");
       this.session = new mj.JanusSession(this.ws.send.bind(this.ws), { timeoutMs: 30000 });
+      // console.dir({ session: this.session })
       console.log("Connecting to extra janus server " + this.serverUrl);
 
       let onOpen;
@@ -227,8 +232,8 @@ class JanusSession {
         reject(error);
       };
 
-      this.ws.addEventListener("close", this.onWebsocketClose);
-      this.ws.addEventListener("message", this.onWebsocketMessage);
+      this.ws.addEventListener("close", this.onWebsocketClose.bind(this));
+      this.ws.addEventListener("message", this.onWebsocketMessage.bind(this));
 
       onOpen = () => {
         this.ws.removeEventListener("open", onOpen);
@@ -244,14 +249,6 @@ class JanusSession {
     // return Promise.all([websocketConnection, this.updateTimeOffset()]);
     await websocketConnection;
     this.active = true;
-    Object.keys(this._publishers).forEach(id => {
-      const room = {
-        room: id,
-        clientId: this._publishers[id].clientId,
-        joinToken: this._publishers[id].joinToken
-      }
-      this._publishers[id] = this.createExtraPublisher(room)
-    })
   }
 
   disconnect() {
@@ -291,7 +288,19 @@ class JanusSession {
 
   async onWebsocketOpen() {
     // Create the Janus Session
+    console.log("Extra janus session open for " + this.serverUrl);
     await this.session.create();
+    console.log("setting session as active")
+
+    this.active = true;
+    Object.keys(this._publishers).forEach(async (id) => {
+      const room = {
+        room: id,
+        clientId: this._publishers[id].clientId,
+        joinToken: this._publishers[id].joinToken
+      }
+      this._publishers[id] = await this.createExtraPublisher(room)
+    })
 
     // Attach the SFU Plugin and create a RTCPeerConnection for the publisher.
     // The publisher sends audio and opens two bidirectional data channels.
@@ -331,6 +340,8 @@ class JanusSession {
   }
 
   onWebsocketMessage(event) {
+    // console.log("extra session message");
+    // console.dir({ event, session: this.session }, { depth: null});
     if (this.session) this.session.receive(JSON.parse(event.data));
   }
 
@@ -385,9 +396,9 @@ class JanusSession {
   async createExtraPublisher(room) {
     if (!this.active) return new JanusPublisher(room);
     var handle = new mj.JanusPluginHandle(this.session);
+    // console.dir(this.peerConnectionConfig, {depth: null})
     var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
 
-    debug("pub waiting for sfu");
     await handle.attach("janus.plugin.sfu");
 
     this.associate(conn, handle);
@@ -395,21 +406,19 @@ class JanusSession {
     debug("pub waiting for data channels & webrtcup");
     var webrtcup = new Promise(resolve => handle.on("webrtcup", resolve));
 
-    /*
     var reliableChannel = conn.createDataChannel("reliable", { ordered: true });
     var unreliableChannel = conn.createDataChannel("unreliable", {
       ordered: false,
       maxRetransmits: 0
     });
 
-    reliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-reliable"));
-    unreliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-unreliable"));
+    // reliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-reliable"));
+    // unreliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-unreliable"));
 
-    */
+    await webrtcup;
     console.log("webrtcup for extra rooms")
-    console.dir(await webrtcup);
-    // await untilDataChannelOpen(reliableChannel);
-    // await untilDataChannelOpen(unreliableChannel);
+    await untilDataChannelOpen(reliableChannel);
+    await untilDataChannelOpen(unreliableChannel);
 
     // doing this here is sort of a hack around chrome renegotiation weirdness --
     // if we do it prior to webrtcup, chrome on gear VR will sometimes put a
@@ -425,7 +434,7 @@ class JanusSession {
     // Handle all of the join and leave events.
     handle.on("event", ev => {
       console.log("event on new extra publisher ")
-      console.dir(ev, { depth: null});
+      // console.dir(ev, { depth: null});
       return
       var data = ev.plugindata.data;
       if (data.event == "join" && data.room_id == this.room) {
@@ -448,12 +457,12 @@ class JanusSession {
     const publisher = new JanusPublisher(room)
 
     // Send join message to janus. Listen for join/leave messages. Automatically subscribe to all users' WebRTC data.
-    var message = publisher.sendJoin(handle, {
+    var message = await publisher.sendJoin({
       notifications: true,
       data: true
     });
 
-    if (!message.plugindata.data.success) {
+    if (!message.plugindata || !message.plugindata.data.success) {
       const err = message.plugindata.data.error;
       console.error(err);
       throw err;
@@ -467,7 +476,7 @@ class JanusSession {
       this.performDelayedReconnect();
     }*/
 
-    debug("publisher " + room.room + " ready");
+    console.log("publisher " + room.room + " ready");
     /*
     return {
       handle,
@@ -529,10 +538,11 @@ class JanusAdapter {
   }
 
   // [ {room: _, serverUrl } ]
-  setExtraRooms(rooms) {
+  async setExtraRooms(rooms) {
     let publishers = {}
     for (let i = 0; i < rooms.length; i++) {
       const room = rooms[i]
+      if (room.room == this.room) continue
       room.peerConnectionConfig = this.peerConnectionConfig
       room.joinToken =  this.joinToken
       room.clientId = this.clientId
@@ -542,21 +552,21 @@ class JanusAdapter {
       if (room.serverUrl == this.serverUrl + 'ssss') {
         console.log("Same janus server for this room " + room.room);
         console.log("current room " + this.room);
-        if (room.room != this.room) publishers[room.room] = this.getOrCreatePublisher(room)
+        if (room.room != this.room) publishers[room.room] = await this.getOrCreatePublisher(room)
       } else {
         console.log("Finding janus session for this room " + room.room);
         const session = this.getOrCreateSession(room);
-        publishers[room.room] = session.getOrCreatePublisher(room)
+        publishers[room.room] = await session.getOrCreatePublisher(room)
       }
     }
 
     this._publishers = publishers
   }
 
-  getOrCreatePublisher(room) {
+  async getOrCreatePublisher(room) {
     if (!this._publishers[room.room]) {
       console.log("Will create janus extra publisher for room " + room.room);
-      this._publishers[room.room] = this.createExtraPublisher(room)
+      this._publishers[room.room] = await this.createExtraPublisher(room)
     }
     return this._publishers[room.room]
   }
@@ -582,6 +592,7 @@ class JanusAdapter {
   }
 
   setJoinToken(joinToken) {
+    console.log("Setting Join Token");
     this.joinToken = joinToken;
     Object.values(this._publishers).forEach(pub => {
       pub.joinToken = joinToken
@@ -589,6 +600,7 @@ class JanusAdapter {
   }
 
   setClientId(clientId) {
+    console.log("Setting client ID");
     this.clientId = clientId;
     Object.values(this._publishers).forEach(pub => {
       pub.clientId = clientId
@@ -721,11 +733,12 @@ class JanusAdapter {
     await Promise.all(addOccupantPromises);
 
     const rooms = [
-      { room: 'nVjmCX5', serverUrl: 'wss://serene-druid.i.stage.mcc-vr.link:80'},
-      { room: 'NqwFgiP', serverUrl: 'wss://serene-druid.i.stage.mcc-vr.link:80'}
+      { room: '2wRM8zT', serverUrl: 'wss://serene-druid.i.stage.mcc-vr.link:80'},
+      { room: 'wF4k8Ra', serverUrl: 'wss://serene-druid.i.stage.mcc-vr.link:80'},
+      { room: 'EjuXWjD', serverUrl: 'wss://serene-druid.i.stage.mcc-vr.link:80'}
     ];
 
-    if (false && localStorage.getItem("upstream")) {
+    if (localStorage.getItem("upstream")) {
       console.log("Setting extra rooms");
       console.log(rooms)
       this.setExtraRooms(rooms);
@@ -823,6 +836,7 @@ class JanusAdapter {
   }
 
   removeOccupant(occupantId) {
+    console.log("Removing Occupant " +  occupantId)
     this.leftOccupants.add(occupantId);
 
     if (this.occupants[occupantId]) {
@@ -846,16 +860,21 @@ class JanusAdapter {
       // Call the Networked AFrame callbacks for the removed occupant.
       this.onOccupantDisconnected(occupantId);
       this.onOccupantsChanged(this.occupants);
+    } else {
+      console.log("Cleaning avatar")
+      this.onOccupantDisconnected(occupantId);
     }
   }
 
   associate(conn, handle) {
     conn.addEventListener("icecandidate", ev => {
+      console.log("icecandidate");
       // console.dir(ev)
       handle.sendTrickle(ev.candidate || null).catch(e => error("Error trickling ICE: %o", e));
     });
     conn.addEventListener("iceconnectionstatechange", ev => {
       // console.dir(ev)
+      // console.log('iceconnectionstatechange')
       if (conn.iceConnectionState === "failed") {
         console.warn("ICE failure detected. Reconnecting in 10s.");
         this.performDelayedReconnect();
@@ -905,7 +924,6 @@ class JanusAdapter {
   }
 
   async createExtraPublisher(room) {
-    console.log("Going on till here");
     var handle = new mj.JanusPluginHandle(this.session);
     var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
 
@@ -917,22 +935,18 @@ class JanusAdapter {
     debug("pub waiting for data channels & webrtcup");
     var webrtcup = new Promise(resolve => handle.on("webrtcup", resolve));
 
-    /*
     var reliableChannel = conn.createDataChannel("reliable", { ordered: true });
     var unreliableChannel = conn.createDataChannel("unreliable", {
       ordered: false,
       maxRetransmits: 0
     });
 
-    reliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-reliable"));
-    unreliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-unreliable"));
+    // reliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-reliable"));
+    // unreliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-unreliable"));
 
-    */
-    console.log("Going on till here2");
     await webrtcup;
-    console.log("Going on till here3");
-    // await untilDataChannelOpen(reliableChannel);
-    // await untilDataChannelOpen(unreliableChannel);
+    await untilDataChannelOpen(reliableChannel);
+    await untilDataChannelOpen(unreliableChannel);
 
     // doing this here is sort of a hack around chrome renegotiation weirdness --
     // if we do it prior to webrtcup, chrome on gear VR will sometimes put a
@@ -945,7 +959,6 @@ class JanusAdapter {
       });
     }
 
-    console.log("Going on till here4");
     // Handle all of the join and leave events.
     handle.on("event", ev => {
       console.log("event on new extra publisher ")
@@ -966,14 +979,13 @@ class JanusAdapter {
     });
 
     debug("pub waiting for join");
-    console.log("Going on till here5");
 
     room.handle = handle
     room.conn = conn
     const publisher = new JanusPublisher(room)
 
     // Send join message to janus. Listen for join/leave messages. Automatically subscribe to all users' WebRTC data.
-    var message = await publisher.sendJoin(handle, {
+    var message = await publisher.sendJoin({
       notifications: true,
       data: true
     });
@@ -992,7 +1004,7 @@ class JanusAdapter {
       this.performDelayedReconnect();
     }*/
 
-    debug("publisher " + room.room + " ready");
+    console.log("publisher " + room.room + " ready");
     /*
     return {
       handle,
@@ -1006,9 +1018,10 @@ class JanusAdapter {
 
   async createPublisher() {
     var handle = new mj.JanusPluginHandle(this.session);
+    console.dir(this.peerConnectionConfig, {depth: null})
     var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
 
-    debug("pub waiting for sfu");
+    console.log("pub waiting for sfu");
     await handle.attach("janus.plugin.sfu");
 
     this.associate(conn, handle);
@@ -1027,8 +1040,7 @@ class JanusAdapter {
     reliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-reliable"));
     unreliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-unreliable"));
 
-    console.log("webrtc up"); 
-    console.dir(await webrtcup);
+    await webrtcup;
     await untilDataChannelOpen(reliableChannel);
     await untilDataChannelOpen(unreliableChannel);
 
@@ -1067,6 +1079,8 @@ class JanusAdapter {
       data: true
     });
 
+    console.log("join resp");
+    console.dir(message, { depth: null});
     if (!message.plugindata.data.success) {
       const err = message.plugindata.data.error;
       console.error(err);
@@ -1080,7 +1094,7 @@ class JanusAdapter {
       this.performDelayedReconnect();
     }
 
-    debug("publisher ready");
+    console.log("publisher " + this.room +  " ready");
     return {
       handle,
       initialOccupants,
@@ -1366,7 +1380,7 @@ class JanusAdapter {
     if (this.frozen) {
       this.storeMessage(message);
     } else {
-      this.onOccupantMessage(null, message.dataType, message.data, message.source);
+      this.onOccupantMessage(message.from_relay ? 'relay' : null, message.dataType, message.data, message.source);
     }
   }
 
