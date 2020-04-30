@@ -535,24 +535,29 @@ class JanusAdapter {
 
     this._publishers = {}
     this._sessions = {}
+    this.mainRooms = []
+    this.extraRooms = {}
   }
 
   // [ {room: _, serverUrl } ]
-  async setExtraRooms(rooms) {
+  async setExtraRooms() {
     let publishers = {}
+    const rooms = []
+    Object.entries(this.extraRooms).forEach(([serverUrl, _rooms]) => {
+      _rooms.forEach(room => rooms.push({ serverUrl, room }))
+    })
     for (let i = 0; i < rooms.length; i++) {
       const room = rooms[i]
-      if (room.room == this.room) continue
       room.peerConnectionConfig = this.peerConnectionConfig
       room.joinToken =  this.joinToken
       room.clientId = this.clientId
       room.webRtcOptions = this.webRtcOptions
       room.localMediaStream = this.localMediaStream
 
-      if (room.serverUrl == this.serverUrl + 'ssss') {
-        console.log("Same janus server for this room " + room.room);
-        console.log("current room " + this.room);
-        if (room.room != this.room) publishers[room.room] = await this.getOrCreatePublisher(room)
+      if (room.serverUrl == this.serverUrl) {
+        console.log("Unexpected same janus server for this room " + room.room);
+        // console.log("current room " + this.room);
+        // if (room.room != this.room) publishers[room.room] = await this.getOrCreatePublisher(room)
       } else {
         console.log("Finding janus session for this room " + room.room);
         const session = this.getOrCreateSession(room);
@@ -566,7 +571,7 @@ class JanusAdapter {
   async getOrCreatePublisher(room) {
     if (!this._publishers[room.room]) {
       console.log("Will create janus extra publisher for room " + room.room);
-      this._publishers[room.room] = await this.createExtraPublisher(room)
+      this._publishers[room.room] = await this.joinExtraRoom(room)
     }
     return this._publishers[room.room]
   }
@@ -588,7 +593,9 @@ class JanusAdapter {
   setApp(app) {}
 
   setRoom(roomName) {
+    console.log("Setting janus room as  " + roomName);
     this.room = roomName;
+    this.mainRooms = [ this.room ]
   }
 
   setJoinToken(joinToken) {
@@ -647,10 +654,55 @@ class JanusAdapter {
     this.onReconnectionError = reconnectionErrorListener;
   }
 
+  async configExtraRooms() {
+    console.log("Configuring extra rooms")
+
+    const _raw = {}
+    const js = 'wss://confident-cleric.i.stage.mcc-vr.link:80'
+    _raw[js] = ['2wRM8zT', 'EjuXWjD']
+
+    /*
+    const rooms = [
+      { room: '2wRM8zT', serverUrl: js},
+      { room: 'wF4k8Ra', serverUrl: js},
+      { room: 'EjuXWjD', serverUrl: js}
+    ];
+    */
+    const raw = {
+      is_speaker: localStorage.getItem("upstream"),
+      is_banned: false,
+      rooms: {
+        'wss://confident-cleric.i.stage.mcc-vr.link:80': ['2wRM8zT', 'EjuXWjD']
+      },
+      god_voices: ['ad8']
+    };
+
+    window.APP.store._god_voices = (raw || {}).god_voices || []
+
+    this.extraRooms = {}
+    if (raw && raw.is_speaker) {
+      console.log("Setting extra rooms for " + window.APP.store.identityName);
+      console.log(raw)
+      // this.setExtraRooms(rooms);
+      Object.keys(raw.rooms).forEach(server => {
+        if (server == this.serverUrl) {
+          this.mainRooms = [ ...(raw.rooms[server])]
+          this.mainRooms.push(this.room)
+          this.mainRooms = [...new Set(this.mainRooms)]
+        } else  {
+          this.extraRooms[server] = [...new Set(raw.rooms[server])].join('-')
+        }
+      })
+    } else {
+      this.mainRooms = [ this.room ]
+    }
+  }
+
   connect() {
     debug(`connecting to ${this.serverUrl}`);
 
-    const websocketConnection = new Promise((resolve, reject) => {
+    const websocketConnection = this.configExtraRooms().then(() => new Promise((resolve, reject) => {
+      console.log("Starting janus connection")
       this.ws = new WebSocket(this.serverUrl, "janus-protocol");
 
       this.session = new mj.JanusSession(this.ws.send.bind(this.ws), { timeoutMs: 30000 });
@@ -673,7 +725,7 @@ class JanusAdapter {
       };
 
       this.ws.addEventListener("open", onOpen);
-    });
+    }));
 
     return Promise.all([websocketConnection, this.updateTimeOffset()]);
   }
@@ -717,6 +769,7 @@ class JanusAdapter {
     // Attach the SFU Plugin and create a RTCPeerConnection for the publisher.
     // The publisher sends audio and opens two bidirectional data channels.
     // One reliable datachannel and one unreliable.
+    console.log("Starting janus publisher")
     this.publisher = await this.createPublisher();
 
     // Call the naf connectSuccess callback before we start receiving WebRTC messages.
@@ -731,18 +784,6 @@ class JanusAdapter {
     }
 
     await Promise.all(addOccupantPromises);
-
-    const rooms = [
-      { room: '2wRM8zT', serverUrl: 'wss://serene-druid.i.stage.mcc-vr.link:80'},
-      { room: 'wF4k8Ra', serverUrl: 'wss://serene-druid.i.stage.mcc-vr.link:80'},
-      { room: 'EjuXWjD', serverUrl: 'wss://serene-druid.i.stage.mcc-vr.link:80'}
-    ];
-
-    if (localStorage.getItem("upstream")) {
-      console.log("Setting extra rooms");
-      console.log(rooms)
-      this.setExtraRooms(rooms);
-    }
   }
 
   onWebsocketClose(event) {
@@ -868,7 +909,7 @@ class JanusAdapter {
 
   associate(conn, handle) {
     conn.addEventListener("icecandidate", ev => {
-      console.log("icecandidate");
+      // console.log("icecandidate");
       // console.dir(ev)
       handle.sendTrickle(ev.candidate || null).catch(e => error("Error trickling ICE: %o", e));
     });
@@ -889,7 +930,7 @@ class JanusAdapter {
       "negotiationneeded",
       debounce(ev => {
         // console.dir(ev);
-        console.log("Sending new offer for handle: %o", handle);
+        // console.log("Sending new offer for handle: %o", handle);
         var offer = conn.createOffer().then(this.configurePublisherSdp).then(this.fixSafariIceUFrag);
         var local = offer.then(o => conn.setLocalDescription(o));
         var remote = offer;
@@ -921,6 +962,19 @@ class JanusAdapter {
         }
       })
     );
+  }
+
+  async joinExtraRoom(room) {
+    console.log("Joining extra room")
+    var message = await this.sendExtraJoin(room);
+    // console.log("join resp");
+    // console.dir(message, { depth: null});
+    if (!message.plugindata || !message.plugindata.data.success) {
+      const err = message.plugindata.data.error;
+      console.error(err);
+      throw err;
+    }
+    console.log("publisher extra room: " + room.room +  " ready");
   }
 
   async createExtraPublisher(room) {
@@ -1018,7 +1072,7 @@ class JanusAdapter {
 
   async createPublisher() {
     var handle = new mj.JanusPluginHandle(this.session);
-    console.dir(this.peerConnectionConfig, {depth: null})
+    // console.dir(this.peerConnectionConfig, {depth: null})
     var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
 
     console.log("pub waiting for sfu");
@@ -1080,7 +1134,7 @@ class JanusAdapter {
     });
 
     console.log("join resp");
-    console.dir(message, { depth: null});
+    // console.dir(message, { depth: null});
     if (!message.plugindata.data.success) {
       const err = message.plugindata.data.error;
       console.error(err);
@@ -1239,11 +1293,25 @@ class JanusAdapter {
   }
 
   sendJoin(handle, subscribe) {
+    console.log("Janus joining " + this.mainRooms.join('-'));
     return handle.sendMessage({
       kind: "join",
-      room_id: this.room,
+      room_id: this.mainRooms.join('-'),
       user_id: this.clientId,
       subscribe,
+      token: this.joinToken
+    });
+  }
+
+  sendExtraJoin(room) {
+    return this.publisher.handle.sendMessage({
+      kind: "join",
+      room_id: room.room,
+      user_id: this.clientId,
+      subscribe: {
+        notifications: true,
+        data: true
+      },
       token: this.joinToken
     });
   }
@@ -1460,7 +1528,7 @@ class JanusAdapter {
   setMediaStream(clientId, stream) {
     // Safari doesn't like it when you use single a mixed media stream where one of the tracks is inactive, so we
     // split the tracks into two streams.
-    console.log("Got void stream for " + clientId);
+    console.log("Got stream for " + clientId);
     const audioStream = new MediaStream();
     stream.getAudioTracks().forEach(track => audioStream.addTrack(track));
     const videoStream = new MediaStream();
@@ -1523,6 +1591,11 @@ class JanusAdapter {
     console.log("Local Stream " + this.clientId);
     this.setMediaStream(this.clientId, stream);
     Object.values(this._sessions).forEach(sess => sess.setLocalMediaStream(stream))
+  }
+
+  setupUpstream() {
+    console.log("Setting extra rooms for " + window.APP.store.identityName);
+    this.setExtraRooms();
   }
 
   enableMicrophone(enabled) {
