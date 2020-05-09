@@ -100,6 +100,12 @@ class JanusSession {
     this.joinToken = room.joinToken
     this.localMediaStream = room.localMediaStream || null
 
+    this.initialReconnectionDelay = 1000 * Math.random();
+    this.reconnectionDelay = this.initialReconnectionDelay;
+    this.reconnectionTimeout = null;
+    this.maxReconnectionAttempts = 1000;
+    this.reconnectionAttempts = 0;
+
     this._publishers = {}
 
     this.active = false
@@ -130,8 +136,8 @@ class JanusSession {
       // console.log("extra iceconnectionstatechange");
       if (conn.iceConnectionState === "failed") {
         console.warn("ICE failure detected. Reconnecting in 10s.");
-        console.error("No reconnect for extra session!");
-        // this.performDelayedReconnect();
+        console.info("Delayed reconnect for extra session!");
+        this.performDelayedReconnect();
       }
     })
 
@@ -254,7 +260,7 @@ class JanusSession {
   disconnect() {
     debug(`disconnecting`);
 
-    // clearTimeout(this.reconnectionTimeout);
+    clearTimeout(this.reconnectionTimeout);
 
     // this.removeAllOccupants();
     // this.leftOccupants = new Set();
@@ -330,13 +336,58 @@ class JanusSession {
       return;
     }
 
-    /*
     if (this.onReconnecting) {
       this.onReconnecting(this.reconnectionDelay);
     }
 
     this.reconnectionTimeout = setTimeout(() => this.reconnect(), this.reconnectionDelay);
-    */
+  }
+
+  reconnect() {
+    console.log("Extra session reconnecting")
+    // Dispose of all networked entities and other resources tied to the session.
+    this.disconnect();
+
+    this.connect()
+      .then(() => {
+        this.reconnectionDelay = this.initialReconnectionDelay;
+        this.reconnectionAttempts = 0;
+
+        if (this.onReconnected) {
+          console.log("Extra session reconnected")
+          this.onReconnected();
+        }
+      })
+      .catch(error => {
+        this.reconnectionDelay += 1000;
+        this.reconnectionAttempts++;
+
+        if (this.reconnectionAttempts > this.maxReconnectionAttempts && this.onReconnectionError) {
+          return this.onReconnectionError(
+            new Error("Connection could not be reestablished, exceeded maximum number of reconnection attempts.")
+          );
+        }
+
+        console.warn("Error during reconnect, retrying.");
+        console.warn(error);
+
+        if (this.onReconnecting) {
+          this.onReconnecting(this.reconnectionDelay);
+        }
+
+        this.reconnectionTimeout = setTimeout(() => this.reconnect(), this.reconnectionDelay);
+      });
+  }
+
+  performDelayedReconnect() {
+    if (this.delayedReconnectTimeout) {
+      clearTimeout(this.delayedReconnectTimeout);
+    }
+
+    this.delayedReconnectTimeout = setTimeout(() => {
+      this.delayedReconnectTimeout = null;
+      this.reconnect();
+    }, 10000);
   }
 
   onWebsocketMessage(event) {
@@ -543,8 +594,8 @@ class JanusAdapter {
   async setExtraRooms() {
     let publishers = {}
     const rooms = []
-    Object.entries(this.extraRooms).forEach(([serverUrl, _rooms]) => {
-      _rooms.forEach(room => rooms.push({ serverUrl, room }))
+    Object.entries(this.extraRooms).forEach(([serverUrl, room]) => {
+      rooms.push({ serverUrl, room })
     })
     for (let i = 0; i < rooms.length; i++) {
       const room = rooms[i]
@@ -656,45 +707,25 @@ class JanusAdapter {
 
   async configExtraRooms() {
     console.log("Configuring extra rooms")
-
-    const _raw = {}
-    const js = 'wss://confident-cleric.i.stage.mcc-vr.link:80'
-    _raw[js] = ['2wRM8zT', 'EjuXWjD']
-
-    /*
-    const rooms = [
-      { room: '2wRM8zT', serverUrl: js},
-      { room: 'wF4k8Ra', serverUrl: js},
-      { room: 'EjuXWjD', serverUrl: js}
-    ];
-    */
-    const raw = {
-      is_speaker: localStorage.getItem("upstream"),
-      is_banned: false,
-      rooms: {
-        'wss://confident-cleric.i.stage.mcc-vr.link:80': ['2wRM8zT', 'EjuXWjD']
-      },
-      god_voices: ['ad8']
-    };
-
+    const res = await fetch('https://mcc-api.mcc-vr.link/auth?email=' + window.APP.store.state.credentials.email).then(d=>d.json())
+    console.dir(res)
+    const raw = res
     window.APP.store._god_voices = (raw || {}).god_voices || []
 
     this.extraRooms = {}
+    this.mainRooms = [ this.room ]
     if (raw && raw.is_speaker) {
       console.log("Setting extra rooms for " + window.APP.store.identityName);
-      console.log(raw)
       // this.setExtraRooms(rooms);
       Object.keys(raw.rooms).forEach(server => {
         if (server == this.serverUrl) {
-          this.mainRooms = [ ...(raw.rooms[server])]
-          this.mainRooms.push(this.room)
-          this.mainRooms = [...new Set(this.mainRooms)]
+          const mainRooms = new Set([ ...(raw.rooms[server])])
+          mainRooms.delete(this.room)
+          this.mainRooms = [this.room, ...mainRooms]
         } else  {
           this.extraRooms[server] = [...new Set(raw.rooms[server])].join('-')
         }
       })
-    } else {
-      this.mainRooms = [ this.room ]
     }
   }
 
@@ -783,6 +814,9 @@ class JanusAdapter {
       addOccupantPromises.push(this.addOccupant(occupantId));
     }
 
+    // console.log("pub init occupants")
+    // console.log(this.publisher.initialOccupants)
+
     await Promise.all(addOccupantPromises);
   }
 
@@ -855,6 +889,7 @@ class JanusAdapter {
 
     this.leftOccupants.delete(occupantId);
 
+    console.log("Creating subscription to " + occupantId);
     var subscriber = await this.createSubscriber(occupantId);
 
     if (!subscriber) return;
@@ -1015,8 +1050,8 @@ class JanusAdapter {
 
     // Handle all of the join and leave events.
     handle.on("event", ev => {
-      console.log("event on new extra publisher ")
-      console.dir(ev, { depth: null});
+      // console.log("event on new extra publisher ")
+      // console.dir(ev, { depth: null});
       return
       var data = ev.plugindata.data;
       if (data.event == "join" && data.room_id == this.room) {
@@ -1112,7 +1147,10 @@ class JanusAdapter {
     // Handle all of the join and leave events.
     handle.on("event", ev => {
       var data = ev.plugindata.data;
+      // console.log("new event")
+      // console.dir(data, {depth:null})
       if (data.event == "join" && data.room_id == this.room) {
+        // console.log("Checking addOccupant")
         this.addOccupant(data.user_id);
       } else if (data.event == "leave" && data.room_id == this.room) {
         this.removeOccupant(data.user_id);
