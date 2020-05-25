@@ -106,7 +106,8 @@ class JanusSession {
     this.maxReconnectionAttempts = 1000;
     this.reconnectionAttempts = 0;
 
-    this._publishers = {}
+    // this._publishers = {}
+    this._publisher = new JanusPublisher(room)
 
     this.active = false
     console.log("Constructing janus session to " + room.serverUrl);
@@ -121,10 +122,14 @@ class JanusSession {
   }
 
   async getOrCreatePublisher(room) {
+    /*
     if (!this._publishers[room.room]) {
       this._publishers[room.room] = await this.createExtraPublisher(room)
     }
-    return this._publishers[room.room]
+    */
+    if (this._publisher && room.room == this._publisher.room) return this._publisher
+    this._publisher = new JanusPublisher(room)
+    return this._publisher
   }
 
   associate(conn, handle) {
@@ -265,13 +270,17 @@ class JanusSession {
     // this.removeAllOccupants();
     // this.leftOccupants = new Set();
 
+    /*
     Object.keys(this._publishers).forEach( room => {
       // Close the publisher peer connection. Which also detaches the plugin handle.
       if (this._publishers[room]) {
-        this._publishers[room].conn.close();
+        if (this._publishers[room].conn) this._publishers[room].conn.close();
         this._publishers[room] = null
       }
-    })
+    })*/
+    if (this._publisher) {
+        if (this._publisher.conn) this._publisher.conn.close();
+    }
 
     if (this.session) {
       this.session.dispose();
@@ -299,6 +308,12 @@ class JanusSession {
     console.log("setting session as active")
 
     this.active = true;
+    if (this._publisher) this._publisher = await this.createExtraPublisher({
+      room: this._publisher.room,
+      clientId: this._publisher.clientId,
+      joinToken: this._publisher.joinToken
+    })
+    /*
     Object.keys(this._publishers).forEach(async (id) => {
       const room = {
         room: id,
@@ -307,6 +322,7 @@ class JanusSession {
       }
       this._publishers[id] = await this.createExtraPublisher(room)
     })
+    */
 
     // Attach the SFU Plugin and create a RTCPeerConnection for the publisher.
     // The publisher sends audio and opens two bidirectional data channels.
@@ -330,6 +346,7 @@ class JanusSession {
   }
 
   onWebsocketClose(event) {
+    this.active = false
     console.error("Extra session ws is closing!");
     // The connection was closed successfully. Don't try to reconnect.
     if (event.code === WS_NORMAL_CLOSURE) {
@@ -397,8 +414,9 @@ class JanusSession {
   }
 
   setLocalMediaStream(stream) {
-    this.localMediaStream  = stream
-    Object.values(this._publishers).forEach(async pub => {
+    this.localMediaStream  = stream;
+    [this._publisher].forEach(async pub => {
+      if (!pub) return
       if (pub.conn) {
         /*
         this.localMediaStream.getTracks().forEach(track => {
@@ -543,6 +561,7 @@ class JanusSession {
 
 class JanusAdapter {
   constructor() {
+    console.log("Janus adapter modified version: 0.0.2.3")
     this.room = null;
     // We expect the consumer to set a client id before connecting.
     this.clientId = null;
@@ -707,10 +726,8 @@ class JanusAdapter {
 
   async configExtraRooms() {
     console.log("Configuring extra rooms")
-    const res = await fetch('https://mcc-api.mcc-vr.link/auth?email=' + window.APP.store.state.credentials.email).then(d=>d.json())
-    console.dir(res)
-    const raw = res
-    window.APP.store._god_voices = (raw || {}).god_voices || []
+    // const res = await fetch('https://mcc-api.mcc-vr.link/auth?email=' + window.APP.store.state.credentials.email + "&room=" +  window.APP.hubChannel.hubId).then(d=>d.json())
+    const raw = window.APP.store._meta
 
     this.extraRooms = {}
     this.mainRooms = [ this.room ]
@@ -727,6 +744,8 @@ class JanusAdapter {
         }
       })
     }
+
+    this.setExtraRooms();
   }
 
   connect() {
