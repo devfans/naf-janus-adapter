@@ -726,8 +726,9 @@ class JanusAdapter {
 
   async configExtraRooms() {
     console.log("Configuring extra rooms")
-    // const res = await fetch('https://mcc-api.mcc-vr.link/auth?email=' + window.APP.store.state.credentials.email + "&room=" +  window.APP.hubChannel.hubId).then(d=>d.json())
+    // const raw = await fetch('https://mcc-api.mcc-vr.link/auth?email=' + window.APP.store.state.credentials.email + "&room=" +  window.APP.hubChannel.hubId).then(d=>d.json())
     const raw = window.APP.store._meta
+    // window.APP.store._meta = raw
 
     this.extraRooms = {}
     this.mainRooms = [ this.room ]
