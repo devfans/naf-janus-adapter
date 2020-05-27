@@ -107,10 +107,17 @@ class JanusSession {
     this.reconnectionAttempts = 0;
 
     // this._publishers = {}
-    this._publisher = new JanusPublisher(room)
+    // this._publisher = new JanusPublisher(room)
 
     this.active = false
     console.log("Constructing janus session to " + room.serverUrl);
+
+    this.pendingSubscribers = []
+  }
+
+  listenForActive(res) {
+    if (this.active) return res()
+    else this.pendingSubscribers.push(res)
   }
 
   setWebRtcOptions(options) {
@@ -308,6 +315,11 @@ class JanusSession {
     console.log("setting session as active")
 
     this.active = true;
+    this.pendingSubscribers.forEach(res => res())
+    this.pendingSubscribers = []
+
+    if (this.reconnectHandler) this.reconnectHandler()
+
     if (this._publisher) this._publisher = await this.createExtraPublisher({
       room: this._publisher.room,
       clientId: this._publisher.clientId,
@@ -415,6 +427,8 @@ class JanusSession {
 
   setLocalMediaStream(stream) {
     this.localMediaStream  = stream;
+    if (!this._publisher) return
+
     [this._publisher].forEach(async pub => {
       if (!pub) return
       if (pub.conn) {
@@ -607,6 +621,7 @@ class JanusAdapter {
     this._sessions = {}
     this.mainRooms = []
     this.extraRooms = {}
+    this.upstreamOccupants = new Set;
   }
 
   // [ {room: _, serverUrl } ]
@@ -636,6 +651,57 @@ class JanusAdapter {
     }
 
     this._publishers = publishers
+  }
+
+  async initUpstream() {
+    console.log("Initializing upstream room")
+    const room = await window._upstream_meta;
+    room.peerConnectionConfig = this.peerConnectionConfig
+    room.joinToken =  this.joinToken
+    room.clientId = this.clientId
+    room.webRtcOptions = this.webRtcOptions
+    room.localMediaStream = this.localMediaStream
+    // const session = this.getOrCreateSession(room)
+    this._upstream_room = room
+    console.log("upstream info")
+    console.dir(room)
+    this._upstream_session = new JanusSession(room)
+
+    const subscribe = () => {
+      const state = new Set(Object.values(window._sess));
+      [...this.upstreamOccupants].forEach(o => {
+        if (!state.has(o)) {
+          this.removeOccupant(o)
+          this.upstreamOccupants.delete(o)
+        }
+      });
+
+      [...state].forEach(async (o) => {
+        if (!this.upstreamOccupants.has(o)) {
+          if (await this.addUpstreamOccupant(o))
+            this.upstreamOccupants.add(o)
+        }
+      })
+    }
+    const update = subscribe.bind(this)
+    window.addEventListener('upstream_update', update)
+
+    const reconnect = () => {
+      [...this.upstreamOccupants].forEach(o => {
+        this.removeOccupant(o)
+        this.upstreamOccupants.delete(o)
+      });
+
+      const state = new Set(Object.values(window._sess));
+      [...state].forEach(async (o) => {
+        if (await this.addUpstreamOccupant(o))
+          this.upstreamOccupants.add(o)
+      })
+    }
+    this._upstream_session.reconnectHandler = reconnect.bind(this)
+    this._upstream_session.connect()
+    if (this.timer) clearInterval(this.timer)
+    this.timer = setInterval(update, 5000)
   }
 
   async getOrCreatePublisher(room) {
@@ -727,12 +793,13 @@ class JanusAdapter {
   async configExtraRooms() {
     console.log("Configuring extra rooms")
     // const raw = await fetch('https://mcc-api.mcc-vr.link/auth?email=' + window.APP.store.state.credentials.email + "&room=" +  window.APP.hubChannel.hubId).then(d=>d.json())
-    const raw = window.APP.store._meta
+    const raw = window._hubs_meta
+    console.log("is speaker: " + raw.is_speaker)
     // window.APP.store._meta = raw
 
     this.extraRooms = {}
     this.mainRooms = [ this.room ]
-    if (raw && raw.is_speaker) {
+    if (false && raw && raw.is_speaker) {
       console.log("Setting extra rooms for " + window.APP.store.identityName);
       // this.setExtraRooms(rooms);
       Object.keys(raw.rooms).forEach(server => {
@@ -900,6 +967,127 @@ class JanusAdapter {
 
   onWebsocketMessage(event) {
     this.session.receive(JSON.parse(event.data));
+  }
+
+  async createUpstreamSubscriber(occupantId) {
+    if (this.leftOccupants.has(occupantId)) {
+      console.warn(occupantId + ": cancelled occupant connection, occupant left before subscription negotation.");
+      return null;
+    }
+
+    await new Promise(res => this._upstream_session.listenForActive(res));
+    console.log("subscribing to " + occupantId);
+
+    var handle = new mj.JanusPluginHandle(this._upstream_session.session);
+    var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
+
+    debug(occupantId + ": sub waiting for sfu");
+    await handle.attach("janus.plugin.sfu");
+
+    this._upstream_session.associate(conn, handle);
+
+    debug(occupantId + ": sub waiting for join");
+
+    if (this.leftOccupants.has(occupantId)) {
+      conn.close();
+      console.warn(occupantId + ": cancelled occupant connection, occupant left after attach");
+      return null;
+    }
+
+    let webrtcFailed = false;
+
+    const webrtcup = new Promise(resolve => {
+      const leftInterval = setInterval(() => {
+        if (this.leftOccupants.has(occupantId)) {
+          clearInterval(leftInterval);
+          resolve();
+        }
+      }, 1000);
+
+      const timeout = setTimeout(() => {
+        clearInterval(leftInterval);
+        webrtcFailed = true;
+        resolve();
+      }, SUBSCRIBE_TIMEOUT_MS);
+
+      handle.on("webrtcup", () => {
+        clearTimeout(timeout);
+        clearInterval(leftInterval);
+        resolve();
+      });
+    });
+
+    // Send join message to janus. Don't listen for join/leave messages. Subscribe to the occupant's media.
+    // Janus should send us an offer for this occupant's media in response to this.
+    const resp = await this.sendUpstreamJoin(handle, { media: occupantId });
+
+    if (this.leftOccupants.has(occupantId)) {
+      conn.close();
+      console.warn(occupantId + ": cancelled occupant connection, occupant left after join");
+      return null;
+    }
+
+    debug(occupantId + ": sub waiting for webrtcup");
+    await webrtcup;
+
+    if (this.leftOccupants.has(occupantId)) {
+      conn.close();
+      console.warn(occupantId + ": cancel occupant connection, occupant left during or after webrtcup");
+      return null;
+    }
+
+    if (webrtcFailed) {
+      conn.close();
+      console.warn(occupantId + ": webrtc up timed out");
+      return null;
+    }
+
+    if (isSafari && !this._iOSHackDelayedInitialPeer) {
+      // HACK: the first peer on Safari during page load can fail to work if we don't
+      // wait some time before continuing here. See: https://github.com/mozilla/hubs/pull/1692
+      await (new Promise((resolve) => setTimeout(resolve, 3000)));
+      this._iOSHackDelayedInitialPeer = true;
+    }
+
+    var mediaStream = new MediaStream();
+    var receivers = conn.getReceivers();
+    receivers.forEach(receiver => {
+      if (receiver.track) {
+        mediaStream.addTrack(receiver.track);
+      }
+    });
+    if (mediaStream.getTracks().length === 0) {
+      mediaStream = null;
+    }
+
+    debug(occupantId + ": subscriber ready");
+    return {
+      handle,
+      mediaStream,
+      conn
+    };
+  }
+
+  async addUpstreamOccupant(occupantId) {
+    if (this.occupants[occupantId]) {
+      this.removeOccupant(occupantId);
+    }
+
+    this.leftOccupants.delete(occupantId);
+    console.log("Creating upstream subscription to " + occupantId);
+    var subscriber = await this.createUpstreamSubscriber(occupantId);
+
+    if (!subscriber) return;
+
+    this.occupants[occupantId] = subscriber;
+
+    this.setMediaStream(occupantId, subscriber.mediaStream);
+
+    // Call the Networked AFrame callbacks for the new occupant.
+    this.onOccupantConnected(occupantId);
+    this.onOccupantsChanged(this.occupants);
+
+    return subscriber;
   }
 
   async addOccupant(occupantId) {
@@ -1361,6 +1549,17 @@ class JanusAdapter {
     });
   }
 
+  sendUpstreamJoin(handle, subscribe) {
+    console.log("Janus upstream joining " + this._upstream_room.room);
+    return handle.sendMessage({
+      kind: "join",
+      room_id: this._upstream_room.room,
+      user_id: this.clientId,
+      subscribe,
+      token: this.joinToken
+    });
+  }
+
   sendExtraJoin(room) {
     return this.publisher.handle.sendMessage({
       kind: "join",
@@ -1653,7 +1852,8 @@ class JanusAdapter {
 
   setupUpstream() {
     console.log("Setting extra rooms for " + window.APP.store.identityName);
-    this.setExtraRooms();
+    // this.setExtraRooms();
+    this.initUpstream();
   }
 
   enableMicrophone(enabled) {
