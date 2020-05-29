@@ -76,6 +76,513 @@ const DEFAULT_PEER_CONNECTION_CONFIG = {
 
 const WS_NORMAL_CLOSURE = 1000;
 
+class JanusPublisher {
+  constructor(room) {
+    this.room = room.room
+    this.clientId = room.clientId
+    this.joinToken = room.joinToken
+    this.session = room.session
+    this.handle = room.handle
+    this.conn = room.conn
+
+    console.log("Constrcucting room publisher to room " + room.room);
+  }
+
+  sendJoin(subscribe) {
+    console.log("Joining extra room " + this.room);
+    return this.handle.sendMessage({
+      kind: "join",
+      room_id: this.room,
+      user_id: this.clientId,
+      subscribe,
+      token: this.joinToken
+    });
+  }
+}
+
+class JanusSession {
+  constructor(room) {
+    this.serverUrl = room.serverUrl
+    this.ws = null
+    this.session = null
+    this.webRtcOptions = room.webRtcOptions
+    this.peerConnectionConfig = room.peerConnectionConfig
+    this.joinToken = room.joinToken
+    this.localMediaStream = room.localMediaStream || null
+
+    this.initialReconnectionDelay = 1000 * Math.random();
+    this.reconnectionDelay = this.initialReconnectionDelay;
+    this.reconnectionTimeout = null;
+    this.maxReconnectionAttempts = 1000;
+    this.reconnectionAttempts = 0;
+
+    // this._publishers = {}
+    if (window._stream_upstream) this._publisher = new JanusPublisher(room)
+
+    this.active = false
+    console.log("Constructing janus session to " + room.serverUrl);
+
+    this.pendingSubscribers = []
+  }
+
+  listenForActive(res) {
+    if (this.active) return res()
+    else this.pendingSubscribers.push(res)
+  }
+
+  setWebRtcOptions(options) {
+    this.webRtcOptions = options;
+  }
+
+  setPeerConnectionConfig(peerConnectionConfig) {
+    this.peerConnectionConfig = peerConnectionConfig;
+  }
+
+  async getOrCreatePublisher(room) {
+    /*
+    if (!this._publishers[room.room]) {
+      this._publishers[room.room] = await this.createExtraPublisher(room)
+    }
+    */
+    if (this._publisher && room.room == this._publisher.room) return this._publisher
+    this._publisher = new JanusPublisher(room)
+    return this._publisher
+  }
+
+  associate(conn, handle) {
+    conn.addEventListener("icecandidate", ev => {
+      // console.log("extra icecandidate");
+      handle.sendTrickle(ev.candidate || null).catch(e => error("Error trickling ICE: %o", e));
+    });
+    conn.addEventListener("iceconnectionstatechange", ev => {
+      // console.log("extra iceconnectionstatechange");
+      if (conn.iceConnectionState === "failed") {
+        console.warn("ICE failure detected. Reconnecting in 10s.");
+        console.info("Delayed reconnect for extra session!");
+        this.performDelayedReconnect();
+      }
+    })
+
+    // we have to debounce these because janus gets angry if you send it a new SDP before
+    // it's finished processing an existing SDP. in actuality, it seems like this is maybe
+    // too liberal and we need to wait some amount of time after an offer before sending another,
+    // but we don't currently know any good way of detecting exactly how long :(
+    conn.addEventListener(
+      "negotiationneeded",
+      debounce(ev => {
+        // console.log("extra negotiationneeded");
+        debug("Sending new offer for handle: %o", handle);
+        var offer = conn.createOffer().then(this.configurePublisherSdp).then(this.fixSafariIceUFrag);
+        var local = offer.then(o => conn.setLocalDescription(o));
+        var remote = offer;
+
+        remote = remote
+          .then(this.fixSafariIceUFrag)
+          .then(j => handle.sendJsep(j))
+          .then(r => conn.setRemoteDescription(r.jsep));
+        return Promise.all([local, remote]).catch(e => error("Error negotiating offer: %o", e));
+      })
+    );
+    handle.on(
+      "event",
+      debounce(ev => {
+        var jsep = ev.jsep;
+        if (jsep && jsep.type == "offer") {
+          debug("Accepting new offer for handle: %o", handle);
+          var answer = conn
+            .setRemoteDescription(this.configureSubscriberSdp(jsep))
+            .then(_ => conn.createAnswer())
+            .then(this.fixSafariIceUFrag);
+          var local = answer.then(a => conn.setLocalDescription(a));
+          var remote = answer.then(j => handle.sendJsep(j));
+          return Promise.all([local, remote]).catch(e => error("Error negotiating answer: %o", e));
+        } else {
+          // some other kind of event, nothing to do
+          return null;
+        }
+      })
+    );
+  }
+
+  configurePublisherSdp(jsep) {
+    jsep.sdp = jsep.sdp.replace(/a=fmtp:(109|111).*\r\n/g, (line, pt) => {
+      const parameters = Object.assign(sdpUtils.parseFmtp(line), OPUS_PARAMETERS);
+      return sdpUtils.writeFmtp({ payloadType: pt, parameters: parameters });
+    });
+    return jsep;
+  }
+
+  configureSubscriberSdp(jsep) {
+    // todo: consider cleaning up these hacks to use sdputils
+    if (!isH264VideoSupported) {
+      if (navigator.userAgent.indexOf("HeadlessChrome") !== -1) {
+        // HeadlessChrome (e.g. puppeteer) doesn't support webrtc video streams, so we remove those lines from the SDP.
+        jsep.sdp = jsep.sdp.replace(/m=video[^]*m=/, "m=");
+      }
+    }
+
+    // TODO: Hack to get video working on Chrome for Android. https://groups.google.com/forum/#!topic/mozilla.dev.media/Ye29vuMTpo8
+    if (navigator.userAgent.indexOf("Android") === -1) {
+      jsep.sdp = jsep.sdp.replace(
+        "a=rtcp-fb:107 goog-remb\r\n",
+        "a=rtcp-fb:107 goog-remb\r\na=rtcp-fb:107 transport-cc\r\na=fmtp:107 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
+      );
+    } else {
+      jsep.sdp = jsep.sdp.replace(
+        "a=rtcp-fb:107 goog-remb\r\n",
+        "a=rtcp-fb:107 goog-remb\r\na=rtcp-fb:107 transport-cc\r\na=fmtp:107 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n"
+      );
+    }
+    return jsep;
+  }
+
+  async fixSafariIceUFrag(jsep) {
+    // Safari produces a \n instead of an \r\n for the ice-ufrag. See https://github.com/meetecho/janus-gateway/issues/1818
+    jsep.sdp = jsep.sdp.replace(/[^\r]\na=ice-ufrag/g, "\r\na=ice-ufrag");
+    return jsep
+  }
+
+  async connect() {
+    this.active = false;
+    debug(`connecting to ${this.serverUrl}`);
+
+    const websocketConnection = new Promise((resolve, reject) => {
+      this.ws = new WebSocket(this.serverUrl, "janus-protocol");
+
+      console.log("Init extra session");
+      this.session = new mj.JanusSession(this.ws.send.bind(this.ws), { timeoutMs: 30000 });
+      // console.dir({ session: this.session })
+      console.log("Connecting to extra janus server " + this.serverUrl);
+
+      let onOpen;
+
+      const onError = () => {
+        reject(error);
+      };
+
+      this.ws.addEventListener("close", this.onWebsocketClose.bind(this));
+      this.ws.addEventListener("message", this.onWebsocketMessage.bind(this));
+
+      onOpen = () => {
+        this.ws.removeEventListener("open", onOpen);
+        this.ws.removeEventListener("error", onError);
+        this.onWebsocketOpen()
+          .then(resolve)
+          .catch(reject);
+      };
+
+      this.ws.addEventListener("open", onOpen);
+    });
+
+    // return Promise.all([websocketConnection, this.updateTimeOffset()]);
+    await websocketConnection;
+    this.active = true;
+  }
+
+  disconnect() {
+    debug(`disconnecting`);
+
+    clearTimeout(this.reconnectionTimeout);
+
+    // this.removeAllOccupants();
+    // this.leftOccupants = new Set();
+
+    /*
+    Object.keys(this._publishers).forEach( room => {
+      // Close the publisher peer connection. Which also detaches the plugin handle.
+      if (this._publishers[room]) {
+        if (this._publishers[room].conn) this._publishers[room].conn.close();
+        this._publishers[room] = null
+      }
+    })*/
+    if (this._publisher) {
+        if (this._publisher.conn) this._publisher.conn.close();
+    }
+
+    if (this.session) {
+      this.session.dispose();
+      this.session = null;
+    }
+
+    if (this.ws) {
+      this.ws.removeEventListener("open", this.onWebsocketOpen);
+      this.ws.removeEventListener("close", this.onWebsocketClose);
+      this.ws.removeEventListener("message", this.onWebsocketMessage);
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+
+  isDisconnected() {
+    return this.ws === null;
+  }
+
+  async onWebsocketOpen() {
+    // Create the Janus Session
+    console.log("Extra janus session open for " + this.serverUrl);
+    await this.session.create();
+    console.log("setting session as active")
+
+    this.active = true;
+    this.pendingSubscribers.forEach(res => res())
+    this.pendingSubscribers = []
+
+    if (this.reconnectHandler) this.reconnectHandler()
+
+    if (this._publisher) this._publisher = await this.createExtraPublisher({
+      room: this._publisher.room,
+      clientId: this._publisher.clientId,
+      joinToken: this._publisher.joinToken
+    })
+    /*
+    Object.keys(this._publishers).forEach(async (id) => {
+      const room = {
+        room: id,
+        clientId: this._publishers[id].clientId,
+        joinToken: this._publishers[id].joinToken
+      }
+      this._publishers[id] = await this.createExtraPublisher(room)
+    })
+    */
+
+    // Attach the SFU Plugin and create a RTCPeerConnection for the publisher.
+    // The publisher sends audio and opens two bidirectional data channels.
+    // One reliable datachannel and one unreliable.
+    // this.publisher = await this.createPublisher();
+
+    // Call the naf connectSuccess callback before we start receiving WebRTC messages.
+    // this.connectSuccess(this.clientId);
+
+    /*
+    const addOccupantPromises = [];
+
+    for (let i = 0; i < this.publisher.initialOccupants.length; i++) {
+      const occupantId = this.publisher.initialOccupants[i];
+      if (occupantId === this.clientId) continue; // Happens during non-graceful reconnects due to zombie sessions
+      addOccupantPromises.push(this.addOccupant(occupantId));
+    }
+
+    await Promise.all(addOccupantPromises);
+    */
+  }
+
+  onWebsocketClose(event) {
+    this.active = false
+    console.error("Extra session ws is closing!");
+    // The connection was closed successfully. Don't try to reconnect.
+    if (event.code === WS_NORMAL_CLOSURE) {
+      return;
+    }
+
+    if (this.onReconnecting) {
+      this.onReconnecting(this.reconnectionDelay);
+    }
+
+    this.reconnectionTimeout = setTimeout(() => this.reconnect(), this.reconnectionDelay);
+  }
+
+  reconnect() {
+    console.log("Extra session reconnecting")
+    // Dispose of all networked entities and other resources tied to the session.
+    this.disconnect();
+
+    this.connect()
+      .then(() => {
+        this.reconnectionDelay = this.initialReconnectionDelay;
+        this.reconnectionAttempts = 0;
+
+        if (this.onReconnected) {
+          console.log("Extra session reconnected")
+          this.onReconnected();
+        }
+      })
+      .catch(error => {
+        this.reconnectionDelay += 1000;
+        this.reconnectionAttempts++;
+
+        if (this.reconnectionAttempts > this.maxReconnectionAttempts && this.onReconnectionError) {
+          return this.onReconnectionError(
+            new Error("Connection could not be reestablished, exceeded maximum number of reconnection attempts.")
+          );
+        }
+
+        console.warn("Error during reconnect, retrying.");
+        console.warn(error);
+
+        if (this.onReconnecting) {
+          this.onReconnecting(this.reconnectionDelay);
+        }
+
+        this.reconnectionTimeout = setTimeout(() => this.reconnect(), this.reconnectionDelay);
+      });
+  }
+
+  performDelayedReconnect() {
+    if (this.delayedReconnectTimeout) {
+      clearTimeout(this.delayedReconnectTimeout);
+    }
+
+    this.delayedReconnectTimeout = setTimeout(() => {
+      this.delayedReconnectTimeout = null;
+      this.reconnect();
+    }, 10000);
+  }
+
+  onWebsocketMessage(event) {
+    // console.log("extra session message");
+    // console.dir({ event, session: this.session }, { depth: null});
+    if (this.session) this.session.receive(JSON.parse(event.data));
+  }
+
+  setLocalMediaStream(stream) {
+    this.localMediaStream  = stream;
+    if (!this._publisher) return
+
+    [this._publisher].forEach(async pub => {
+      if (!pub) return
+      if (pub.conn) {
+        /*
+        this.localMediaStream.getTracks().forEach(track => {
+          pub.conn.addTrack(track, this.localMediaStream);
+        });
+        */
+
+        const existingSenders = pub.conn.getSenders();
+        const newSenders = [];
+        const tracks = stream.getTracks();
+
+        for (let i = 0; i < tracks.length; i++) {
+          const t = tracks[i];
+          const sender = existingSenders.find(s => s.track != null && s.track.kind == t.kind);
+
+          if (sender != null) {
+            if (sender.replaceTrack) {
+              await sender.replaceTrack(t);
+
+              // Workaround https://bugzilla.mozilla.org/show_bug.cgi?id=1576771
+              if (t.kind === "video" && t.enabled && navigator.userAgent.toLowerCase().indexOf('firefox') > -1) {
+                t.enabled = false;
+                setTimeout(() => t.enabled = true, 1000);
+              }
+            } else {
+              // Fallback for browsers that don't support replaceTrack. At this time of this writing
+              // most browsers support it, and testing this code path seems to not work properly
+              // in Chrome anymore.
+              stream.removeTrack(sender.track);
+              stream.addTrack(t);
+            }
+            newSenders.push(sender);
+          } else {
+            newSenders.push(pub.conn.addTrack(t, stream));
+          }
+        }
+        existingSenders.forEach(s => {
+          if (!newSenders.includes(s)) {
+            s.track.enabled = false;
+          }
+        });
+      }
+    })
+  }
+
+  async createExtraPublisher(room) {
+    if (!this.active) return new JanusPublisher(room);
+    var handle = new mj.JanusPluginHandle(this.session);
+    // console.dir(this.peerConnectionConfig, {depth: null})
+    var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
+
+    await handle.attach("janus.plugin.sfu");
+
+    this.associate(conn, handle);
+
+    debug("pub waiting for data channels & webrtcup");
+    var webrtcup = new Promise(resolve => handle.on("webrtcup", resolve));
+
+    var reliableChannel = conn.createDataChannel("reliable", { ordered: true });
+    var unreliableChannel = conn.createDataChannel("unreliable", {
+      ordered: false,
+      maxRetransmits: 0
+    });
+
+    // reliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-reliable"));
+    // unreliableChannel.addEventListener("message", e => this.onDataChannelMessage(e, "janus-unreliable"));
+
+    await webrtcup;
+    console.log("webrtcup for extra rooms")
+    await untilDataChannelOpen(reliableChannel);
+    await untilDataChannelOpen(unreliableChannel);
+
+    // doing this here is sort of a hack around chrome renegotiation weirdness --
+    // if we do it prior to webrtcup, chrome on gear VR will sometimes put a
+    // renegotiation offer in flight while the first offer was still being
+    // processed by janus. we should find some more principled way to figure out
+    // when janus is done in the future.
+    if (this.localMediaStream) {
+      this.localMediaStream.getTracks().forEach(track => {
+        conn.addTrack(track, this.localMediaStream);
+      });
+    }
+
+    // Handle all of the join and leave events.
+    handle.on("event", ev => {
+      console.log("event on new extra publisher ")
+      // console.dir(ev, { depth: null});
+      return
+      var data = ev.plugindata.data;
+      if (data.event == "join" && data.room_id == this.room) {
+        this.addOccupant(data.user_id);
+      } else if (data.event == "leave" && data.room_id == this.room) {
+        this.removeOccupant(data.user_id);
+      } else if (data.event == "blocked") {
+        document.body.dispatchEvent(new CustomEvent("blocked", { detail: { clientId: data.by } }));
+      } else if (data.event == "unblocked") {
+        document.body.dispatchEvent(new CustomEvent("unblocked", { detail: { clientId: data.by } }));
+      } else if (data.event === "data") {
+        this.onData(JSON.parse(data.body), "janus-event");
+      }
+    });
+
+    debug("pub waiting for join");
+
+    room.handle = handle
+    room.conn = conn
+    const publisher = new JanusPublisher(room)
+
+    // Send join message to janus. Listen for join/leave messages. Automatically subscribe to all users' WebRTC data.
+    var message = await publisher.sendJoin({
+      notifications: true,
+      data: true
+    });
+
+    if (!message.plugindata || !message.plugindata.data.success) {
+      const err = message.plugindata.data.error;
+      console.error(err);
+      throw err;
+    }
+
+    /*
+    var initialOccupants = message.plugindata.data.response.users[this.room] || [];
+
+    if (initialOccupants.includes(this.clientId)) {
+      console.warn("Janus still has previous session for this client. Reconnecting in 10s.");
+      this.performDelayedReconnect();
+    }*/
+
+    console.log("publisher " + room.room + " ready");
+    /*
+    return {
+      handle,
+      initialOccupants: [],
+      reliableChannel: null,
+      unreliableChannel: null,
+      conn
+    };
+    */
+    return publisher
+  }
+}
+
+
 class JanusAdapter {
   constructor() {
     this.room = null;
@@ -122,6 +629,256 @@ class JanusAdapter {
     this.onWebsocketMessage = this.onWebsocketMessage.bind(this);
     this.onDataChannelMessage = this.onDataChannelMessage.bind(this);
     this.onData = this.onData.bind(this);
+
+    this._publishers = {}
+    this._sessions = {}
+    this.mainRooms = []
+    this.extraRooms = {}
+
+    if (window._solution == 2) window.addEventListener('guestspeaker_update', this.updateSpeakerSource.bind(this));
+  }
+
+  updateSpeakerSource () {
+  }
+
+  async setExtraRooms() {
+    let publishers = {}
+    const rooms = []
+    Object.entries(this.extraRooms).forEach(([serverUrl, room]) => {
+      rooms.push({ serverUrl, room })
+    });
+    for (let i = 0; i < rooms.length; i++) {
+      const room = rooms[i]
+      room.peerConnectionConfig = this.peerConnectionConfig
+      room.joinToken =  this.joinToken
+      room.clientId = this.clientId
+      room.webRtcOptions = this.webRtcOptions
+      room.localMediaStream = this.localMediaStream
+
+      if (room.serverUrl == this.serverUrl) {
+        console.log("Unexpected same janus server for this room " + room.room);
+        // console.log("current room " + this.room);
+        // if (room.room != this.room) publishers[room.room] = await this.getOrCreatePublisher(room)
+      } else {
+        console.log("Finding janus session for this room " + room.room);
+        const session = this.getOrCreateSession(room);
+        publishers[room.room] = await session.getOrCreatePublisher(room)
+      }
+    }
+
+    this._publishers = publishers
+  }
+
+  async initUpstream() {
+    console.log("Initializing upstream room")
+    const room = await window._upstream_meta;
+    room.peerConnectionConfig = this.peerConnectionConfig
+    room.joinToken =  this.joinToken
+    room.clientId = this.clientId
+    room.webRtcOptions = this.webRtcOptions
+    room.localMediaStream = this.localMediaStream
+    // const session = this.getOrCreateSession(room)
+    this._upstream_room = room
+    console.log("upstream info")
+    console.dir(room)
+    this._upstream_session = new JanusSession(room)
+    const update = subscribe.bind(this)
+    window.addEventListener('upstream_update', this.syncOccupants.bind(this))
+    this._upstream_session.reconnectHandler = this.syncOccupants.bind(this)
+    this._upstream_session.connect()
+    this.syncOccupants();
+    // if (this.timer) clearInterval(this.timer)
+    // this.timer = setInterval(update, 5000)
+  }
+
+  async configExtraRooms() {
+    console.log("Configuring extra rooms")
+    // const raw = await fetch('https://mcc-api.mcc-vr.link/auth?email=' + window.APP.store.state.credentials.email + "&room=" +  window.APP.hubChannel.hubId).then(d=>d.json())
+    const raw = window._hubs_meta
+    console.log("is speaker: " + raw.is_speaker)
+    // window.APP.store._meta = raw
+
+    this.extraRooms = {}
+    this.mainRooms = [ this.room ]
+    if (window._stream_upstream && raw && raw.is_speaker) {
+      console.log("Setting extra rooms for " + window.APP.store.identityName);
+      // this.setExtraRooms(rooms);
+      Object.keys(raw.rooms).forEach(server => {
+        if (server == this.serverUrl) {
+          const mainRooms = new Set([ ...(raw.rooms[server])])
+          mainRooms.delete(this.room)
+          this.mainRooms = [this.room, ...mainRooms]
+        } else  {
+          this.extraRooms[server] = [...new Set(raw.rooms[server])].join('-')
+        }
+      })
+    }
+
+    this.setExtraRooms();
+  }
+
+  async addUpstreamOccupant(occupantId) {
+    this.pendingOccupants.add(occupantId);
+    
+    const availableOccupantsCount = this.availableOccupants.length;
+    if (availableOccupantsCount > AVAILABLE_OCCUPANTS_THRESHOLD) {
+      await randomDelay(0, MAX_SUBSCRIBE_DELAY);
+    }
+  
+    console.log("Creating upstream subscription to " + occupantId);
+    const subscriber = await this.createUpstreamSubscriber(occupantId);
+    if (subscriber) {
+      if(!this.pendingOccupants.has(occupantId)) {
+        subscriber.conn.close();
+      } else {
+        this.pendingOccupants.delete(occupantId);
+        this.occupantIds.push(occupantId);
+        this.occupants[occupantId] = subscriber;
+
+        this.setMediaStream(occupantId, subscriber.mediaStream);
+
+        // Call the Networked AFrame callbacks for the new occupant.
+        this.onOccupantConnected(occupantId);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async getOrCreatePublisher(room) {
+    if (!this._publishers[room.room]) {
+      console.log("Will create janus extra publisher for room " + room.room);
+      this._publishers[room.room] = await this.joinExtraRoom(room)
+    }
+    return this._publishers[room.room]
+  }
+
+  getOrCreateSession (room) {
+    if (!this._sessions[room.serverUrl]) {
+      const session = new JanusSession(room)
+      session.connect()
+      this._sessions[room.serverUrl] = session
+    }
+    return this._sessions[room.serverUrl]
+  }
+
+  setupUpstream() {
+    console.log("Setting extra rooms for " + window.APP.store.identityName);
+    if (window._stream_upstream) this.setExtraRooms();
+    else if (window._stream_jmr_downstream) this.initUpstream();
+  }
+
+  async createUpstreamSubscriber(occupantId, maxRetries = 5) {
+    if (this.availableOccupants.indexOf(occupantId) === -1) {
+      console.warn(occupantId + ": cancelled occupant connection, occupant left before subscription negotation.");
+      return null;
+    }
+
+    await new Promise(res => this._upstream_session.listenForActive(res));
+    var handle = new mj.JanusPluginHandle(this._upstream_session);
+    var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
+
+    debug(occupantId + ": sub waiting for sfu");
+    await handle.attach("janus.plugin.sfu");
+
+    this._upstream_session.associate(conn, handle);
+
+    debug(occupantId + ": sub waiting for join");
+
+    if (this.availableOccupants.indexOf(occupantId) === -1) {
+      conn.close();
+      console.warn(occupantId + ": cancelled occupant connection, occupant left after attach");
+      return null;
+    }
+
+    let webrtcFailed = false;
+
+    const webrtcup = new Promise(resolve => {
+      const leftInterval = setInterval(() => {
+        if (this.availableOccupants.indexOf(occupantId) === -1) {
+          clearInterval(leftInterval);
+          resolve();
+        }
+      }, 1000);
+
+      const timeout = setTimeout(() => {
+        clearInterval(leftInterval);
+        webrtcFailed = true;
+        resolve();
+      }, SUBSCRIBE_TIMEOUT_MS);
+
+      handle.on("webrtcup", () => {
+        clearTimeout(timeout);
+        clearInterval(leftInterval);
+        resolve();
+      });
+    });
+
+    // Send join message to janus. Don't listen for join/leave messages. Subscribe to the occupant's media.
+    // Janus should send us an offer for this occupant's media in response to this.
+    await this.sendUpstreamJoin(handle, { media: occupantId });
+
+    if (this.availableOccupants.indexOf(occupantId) === -1) {
+      conn.close();
+      console.warn(occupantId + ": cancelled occupant connection, occupant left after join");
+      return null;
+    }
+
+    debug(occupantId + ": sub waiting for webrtcup");
+    await webrtcup;
+
+    if (this.availableOccupants.indexOf(occupantId) === -1) {
+      conn.close();
+      console.warn(occupantId + ": cancel occupant connection, occupant left during or after webrtcup");
+      return null;
+    }
+
+    if (webrtcFailed) {
+      conn.close();
+      if (maxRetries > 0) {
+        console.warn(occupantId + ": webrtc up timed out, retrying");
+        return this.createUpstreamSubscriber(occupantId, maxRetries - 1);
+      } else {
+        console.warn(occupantId + ": webrtc up timed out");
+        return null;
+      }
+    }
+
+    if (isSafari && !this._iOSHackDelayedInitialPeer) {
+      // HACK: the first peer on Safari during page load can fail to work if we don't
+      // wait some time before continuing here. See: https://github.com/mozilla/hubs/pull/1692
+      await (new Promise((resolve) => setTimeout(resolve, 3000)));
+      this._iOSHackDelayedInitialPeer = true;
+    }
+
+    var mediaStream = new MediaStream();
+    var receivers = conn.getReceivers();
+    receivers.forEach(receiver => {
+      if (receiver.track) {
+        mediaStream.addTrack(receiver.track);
+      }
+    });
+    if (mediaStream.getTracks().length === 0) {
+      mediaStream = null;
+    }
+
+    debug(occupantId + ": subscriber ready");
+    return {
+      handle,
+      mediaStream,
+      conn
+    };
+  }
+
+  sendUpstreamJoin(handle, subscribe) {
+    console.log("Janus upstream joining " + this._upstream_room.room);
+    return handle.sendMessage({
+      kind: "join",
+      room_id: this._upstream_room.room,
+      user_id: this.clientId,
+      subscribe,
+      token: this.joinToken
+    });
   }
 
   setServerUrl(url) {
@@ -136,18 +893,30 @@ class JanusAdapter {
 
   setJoinToken(joinToken) {
     this.joinToken = joinToken;
+    Object.values(this._publishers).forEach(pub => {
+      pub.joinToken = joinToken
+    })
   }
 
   setClientId(clientId) {
     this.clientId = clientId;
+    Object.values(this._publishers).forEach(pub => {
+      pub.clientId = clientId
+    })
   }
 
   setWebRtcOptions(options) {
     this.webRtcOptions = options;
+    Object.values(this._sessions).forEach(sess => {
+      sess.webRtcOptions = options
+    })
   }
 
   setPeerConnectionConfig(peerConnectionConfig) {
     this.peerConnectionConfig = peerConnectionConfig;
+    Object.values(this._sessions).forEach(sess => {
+      sess.peerConnectionConfig = peerConnectionConfig;
+    })
   }
 
   setServerConnectListeners(successListener, failureListener) {
@@ -177,7 +946,7 @@ class JanusAdapter {
   connect() {
     debug(`connecting to ${this.serverUrl}`);
 
-    const websocketConnection = new Promise((resolve, reject) => {
+    const websocketConnection = this.configExtraRooms().then(() => new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.serverUrl, "janus-protocol");
 
       this.session = new mj.JanusSession(this.ws.send.bind(this.ws), { timeoutMs: 30000 });
@@ -337,7 +1106,7 @@ class JanusAdapter {
       this.requestedOccupants = requestedOccupants;
     }
 
-    if (!this.requestedOccupants) {
+    if (!this.requestedOccupants && !window._stream_jmr_downstream) {
       return;
     }
 
@@ -349,10 +1118,18 @@ class JanusAdapter {
       }
     }
 
+    let upstreamOccupants = new Set;
+    if (window._stream_jmr_downstream) {
+      upstreamOccupants = new Set(Object.values(window._sess).filter(k=>k));
+      upstreamOccupants.forEach(occupantId => {
+        if (!this.occupants[occupantId] && this.availableOccupants.indexOf(occupantId) !== -1 && !this.pendingOccupants.has(occupantId)) this.addUpstreamOccupant(occupantId);
+      });
+    }
+
     // Remove any unrequested and currently added occupants.
     for (let j = 0; j < this.availableOccupants.length; j++) {
       const occupantId = this.availableOccupants[j];
-      if (this.occupants[occupantId] && this.requestedOccupants.indexOf(occupantId) === -1) {
+      if (this.occupants[occupantId] && this.requestedOccupants.indexOf(occupantId) === -1 && !upstreamOccupants.has(occupantId)) {
         this.removeOccupant(occupantId);
       }
     }
@@ -837,7 +1614,7 @@ class JanusAdapter {
     if (this.frozen) {
       this.storeMessage(message);
     } else {
-      this.onOccupantMessage(null, message.dataType, message.data, message.source);
+      this.onOccupantMessage(message.from_relay ? 'relay' : null, message.dataType, message.data, message.source);
     }
   }
 
@@ -990,6 +1767,7 @@ class JanusAdapter {
     }
     this.localMediaStream = stream;
     this.setMediaStream(this.clientId, stream);
+    Object.values(this._sessions).forEach(sess => sess.setLocalMediaStream(stream))
   }
 
   enableMicrophone(enabled) {
@@ -1000,6 +1778,15 @@ class JanusAdapter {
         }
       });
     }
+    Object.values(this._publishers).forEach(pub => {
+      if (pub.conn) {
+        pub.conn.getSenders().forEach(s => {
+          if (s.track.kind == "audio") {
+            s.track.enabled = enabled;
+          }
+        });
+      }
+    })
   }
 
   sendData(clientId, dataType, data) {
