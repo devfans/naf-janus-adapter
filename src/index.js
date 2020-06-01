@@ -634,6 +634,7 @@ class JanusAdapter {
     this._sessions = {}
     this.mainRooms = []
     this.extraRooms = {}
+    this.upstreamParams = {}
 
     if (window._solution == 2) window.addEventListener('guestspeaker_update', this.updateSpeakerSource.bind(this));
   }
@@ -671,10 +672,10 @@ class JanusAdapter {
 
   async initUpstream() {
     console.log("Initializing upstream room")
-    const room = await window._upstream_meta;
-    room.peerConnectionConfig = this.peerConnectionConfig
-    room.joinToken =  this.joinToken
-    room.clientId = this.clientId
+    const meta = await window._upstream_meta;
+    Object.assign(this.upstreamParams, meta||{})
+    const room =  {};
+    Object.assign(room, this.upstreamParams);
     room.webRtcOptions = this.webRtcOptions
     room.localMediaStream = this.localMediaStream
     // const session = this.getOrCreateSession(room)
@@ -682,9 +683,11 @@ class JanusAdapter {
     console.log("upstream info")
     console.dir(room)
     this._upstream_session = new JanusSession(room)
-    const update = subscribe.bind(this)
-    window.addEventListener('upstream_update', this.syncOccupants.bind(this))
+    // const update = subscribe.bind(this)
+    const update = this.syncOccupants.bind(this);
+    window.addEventListener('upstream_update', () => update());
     this._upstream_session.reconnectHandler = this.syncOccupants.bind(this)
+    this._upstream_session_ready = true;
     this._upstream_session.connect()
     this.syncOccupants();
     // if (this.timer) clearInterval(this.timer)
@@ -718,6 +721,8 @@ class JanusAdapter {
   }
 
   async addUpstreamOccupant(occupantId) {
+    if (!this._upstream_session_ready) return;
+    console.log("Subscribing to upstream" + occupantId);
     this.pendingOccupants.add(occupantId);
     
     const availableOccupantsCount = this.availableOccupants.length;
@@ -725,7 +730,6 @@ class JanusAdapter {
       await randomDelay(0, MAX_SUBSCRIBE_DELAY);
     }
   
-    console.log("Creating upstream subscription to " + occupantId);
     const subscriber = await this.createUpstreamSubscriber(occupantId);
     if (subscriber) {
       if(!this.pendingOccupants.has(occupantId)) {
@@ -775,8 +779,9 @@ class JanusAdapter {
     }
 
     await new Promise(res => this._upstream_session.listenForActive(res));
-    var handle = new mj.JanusPluginHandle(this._upstream_session);
-    var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
+    console.log("Creating subscription for " + occupantId);
+    var handle = new mj.JanusPluginHandle(this._upstream_session.session);
+    var conn = new RTCPeerConnection(this.upstreamParams.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
 
     debug(occupantId + ": sub waiting for sfu");
     await handle.attach("janus.plugin.sfu");
@@ -875,9 +880,9 @@ class JanusAdapter {
     return handle.sendMessage({
       kind: "join",
       room_id: this._upstream_room.room,
-      user_id: this.clientId,
+      user_id: this.upstreamParams.clientId,
       subscribe,
-      token: this.joinToken
+      token: this.upstreamParams.joinToken
     });
   }
 
@@ -896,6 +901,10 @@ class JanusAdapter {
     Object.values(this._publishers).forEach(pub => {
       pub.joinToken = joinToken
     })
+  }
+
+  setUpstreamJoinToken(joinToken) {
+    this.upstreamParams.joinToken = joinToken;
   }
 
   setClientId(clientId) {
@@ -917,6 +926,10 @@ class JanusAdapter {
     Object.values(this._sessions).forEach(sess => {
       sess.peerConnectionConfig = peerConnectionConfig;
     })
+  }
+
+  setUpstreamPeerConnectionConfig(peerConnectionConfig) {
+    this.upstreamParams.peerConnectionConfig = peerConnectionConfig;
   }
 
   setServerConnectListeners(successListener, failureListener) {
@@ -969,7 +982,7 @@ class JanusAdapter {
       };
 
       this.ws.addEventListener("open", onOpen);
-    });
+    }));
 
     return Promise.all([websocketConnection, this.updateTimeOffset()]);
   }
@@ -1105,31 +1118,27 @@ class JanusAdapter {
     if (requestedOccupants) {
       this.requestedOccupants = requestedOccupants;
     }
-
-    if (!this.requestedOccupants && !window._stream_jmr_downstream) {
-      return;
+    const checkUpstream = window._stream_jmr_downstream;
+    let upstreamOccupants = new Set;
+    if (checkUpstream) {
+      upstreamOccupants = new Set(Object.values(window._sess).filter(k=>k));
+      upstreamOccupants.forEach(o => this.addAvailableOccupant(o));
     }
+    const occupants = new Set(this.requestedOccupants || [])
+    upstreamOccupants.forEach(o => occupants.add(o));
 
     // Add any requested, available, and non-pending occupants.
-    for (let i = 0; i < this.requestedOccupants.length; i++) {
-      const occupantId = this.requestedOccupants[i];
+    occupants.forEach(occupantId => {
       if (!this.occupants[occupantId] && this.availableOccupants.indexOf(occupantId) !== -1 && !this.pendingOccupants.has(occupantId)) {
-        this.addOccupant(occupantId);
+        if ((checkUpstream) && upstreamOccupants.has(occupantId)) this.addUpstreamOccupant(occupantId)
+        else this.addOccupant(occupantId);
       }
-    }
-
-    let upstreamOccupants = new Set;
-    if (window._stream_jmr_downstream) {
-      upstreamOccupants = new Set(Object.values(window._sess).filter(k=>k));
-      upstreamOccupants.forEach(occupantId => {
-        if (!this.occupants[occupantId] && this.availableOccupants.indexOf(occupantId) !== -1 && !this.pendingOccupants.has(occupantId)) this.addUpstreamOccupant(occupantId);
-      });
-    }
+    })
 
     // Remove any unrequested and currently added occupants.
     for (let j = 0; j < this.availableOccupants.length; j++) {
       const occupantId = this.availableOccupants[j];
-      if (this.occupants[occupantId] && this.requestedOccupants.indexOf(occupantId) === -1 && !upstreamOccupants.has(occupantId)) {
+      if (this.occupants[occupantId] && !occupants.has(occupantId)) {
         this.removeOccupant(occupantId);
       }
     }
@@ -1139,6 +1148,7 @@ class JanusAdapter {
   }
 
   async addOccupant(occupantId) {
+    console.log("subscribing to " + occupantId);
     this.pendingOccupants.add(occupantId);
     
     const availableOccupantsCount = this.availableOccupants.length;
@@ -1695,6 +1705,7 @@ class JanusAdapter {
   }
 
   setMediaStream(clientId, stream) {
+    console.log("Got stream of " + clientId);
     // Safari doesn't like it when you use single a mixed media stream where one of the tracks is inactive, so we
     // split the tracks into two streams.
     const audioStream = new MediaStream();
