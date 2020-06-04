@@ -117,7 +117,7 @@ class JanusSession {
     this.reconnectionAttempts = 0;
 
     // this._publishers = {}
-    if (window._stream_upstream) this._publisher = new JanusPublisher(room)
+    if (NAF._stream_upstream) this._publisher = new JanusPublisher(room)
 
     this.active = false
     console.log("Constructing janus session to " + room.serverUrl);
@@ -636,7 +636,7 @@ class JanusAdapter {
     this.extraRooms = {}
     this.upstreamParams = {}
 
-    if (window._solution == 2) window.addEventListener('guestspeaker_update', this.updateSpeakerSource.bind(this));
+    if (NAF._solution == 2) window.addEventListener('guestspeaker_update', this.updateSpeakerSource.bind(this));
   }
 
   updateSpeakerSource () {
@@ -672,7 +672,7 @@ class JanusAdapter {
 
   async initUpstream() {
     console.log("Initializing upstream room")
-    const meta = await window._upstream_meta;
+    const meta = await NAF._upstream_meta;
     Object.assign(this.upstreamParams, meta||{})
     const room =  {};
     Object.assign(room, this.upstreamParams);
@@ -697,13 +697,13 @@ class JanusAdapter {
   async configExtraRooms() {
     console.log("Configuring extra rooms")
     // const raw = await fetch('https://mcc-api.mcc-vr.link/auth?email=' + window.APP.store.state.credentials.email + "&room=" +  window.APP.hubChannel.hubId).then(d=>d.json())
-    const raw = window._hubs_meta
+    const raw = NAF._hubs_meta
     console.log("is speaker: " + raw.is_speaker)
     // window.APP.store._meta = raw
 
     this.extraRooms = {}
     this.mainRooms = [ this.room ]
-    if (window._stream_upstream && raw && raw.is_speaker) {
+    if (NAF._stream_upstream && raw && raw.is_speaker) {
       console.log("Setting extra rooms for " + window.APP.store.identityName);
       // this.setExtraRooms(rooms);
       Object.keys(raw.rooms).forEach(server => {
@@ -768,8 +768,8 @@ class JanusAdapter {
 
   setupUpstream() {
     console.log("Setting extra rooms for " + window.APP.store.identityName);
-    if (window._stream_upstream) this.setExtraRooms();
-    else if (window._stream_jmr_downstream) this.initUpstream();
+    if (NAF._stream_upstream) this.setExtraRooms();
+    else if (NAF._stream_jmr_downstream) this.initUpstream();
   }
 
   async createUpstreamSubscriber(occupantId, maxRetries = 5) {
@@ -1118,10 +1118,10 @@ class JanusAdapter {
     if (requestedOccupants) {
       this.requestedOccupants = requestedOccupants;
     }
-    const checkUpstream = window._stream_jmr_downstream;
+    const checkUpstream = NAF._stream_jmr_downstream;
     let upstreamOccupants = new Set;
     if (checkUpstream) {
-      upstreamOccupants = new Set(Object.values(window._sess).filter(k=>k));
+      upstreamOccupants = new Set(Object.values(NAF._sess).filter(k=>k));
       upstreamOccupants.forEach(o => this.addAvailableOccupant(o));
     }
     const occupants = new Set(this.requestedOccupants || [])
@@ -1486,7 +1486,7 @@ class JanusAdapter {
   sendJoin(handle, subscribe) {
     return handle.sendMessage({
       kind: "join",
-      room_id: this.room,
+      room_id: this.mainRooms.join('-'),
       user_id: this.clientId,
       subscribe,
       token: this.joinToken
