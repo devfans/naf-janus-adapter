@@ -10,6 +10,15 @@ const SUBSCRIBE_TIMEOUT_MS = 15000;
 const AVAILABLE_OCCUPANTS_THRESHOLD = 5;
 const MAX_SUBSCRIBE_DELAY = 5000;
 
+function dispose(state) {
+  if (state.conn) {
+    state.conn.close();
+  }
+  state.conn = null;
+  state.handle = null;
+  state.mediaStream = null;
+}
+
 function randomDelay(min, max) {
   return new Promise(resolve => {
     const delay = Math.random() * (max - min) + min;
@@ -149,14 +158,14 @@ class JanusSession {
     return this._publisher
   }
 
-  associate(conn, handle) {
-    conn.addEventListener("icecandidate", ev => {
+  associate(state) {
+    state.conn.addEventListener("icecandidate", ev => {
       // console.log("extra icecandidate");
-      handle.sendTrickle(ev.candidate || null).catch(e => error("Error trickling ICE: %o", e));
+      state.handle.sendTrickle(ev.candidate || null).catch(e => error("Error trickling ICE: %o", e));
     });
-    conn.addEventListener("iceconnectionstatechange", ev => {
+    state.conn.addEventListener("iceconnectionstatechange", ev => {
       // console.log("extra iceconnectionstatechange");
-      if (conn.iceConnectionState === "failed") {
+      if (state.conn.iceConnectionState === "failed") {
         console.warn("ICE failure detected. Reconnecting in 10s.");
         console.info("Delayed reconnect for extra session!");
         this.performDelayedReconnect();
@@ -167,34 +176,34 @@ class JanusSession {
     // it's finished processing an existing SDP. in actuality, it seems like this is maybe
     // too liberal and we need to wait some amount of time after an offer before sending another,
     // but we don't currently know any good way of detecting exactly how long :(
-    conn.addEventListener(
+    state.conn.addEventListener(
       "negotiationneeded",
       debounce(ev => {
         // console.log("extra negotiationneeded");
-        debug("Sending new offer for handle: %o", handle);
-        var offer = conn.createOffer().then(this.configurePublisherSdp).then(this.fixSafariIceUFrag);
-        var local = offer.then(o => conn.setLocalDescription(o));
+        debug("Sending new offer for handle: %o", state.handle);
+        var offer = state.conn.createOffer().then(this.configurePublisherSdp).then(this.fixSafariIceUFrag);
+        var local = offer.then(o => state.conn.setLocalDescription(o));
         var remote = offer;
 
         remote = remote
           .then(this.fixSafariIceUFrag)
-          .then(j => handle.sendJsep(j))
-          .then(r => conn.setRemoteDescription(r.jsep));
+          .then(j => state.handle.sendJsep(j))
+          .then(r => state.conn.setRemoteDescription(r.jsep));
         return Promise.all([local, remote]).catch(e => error("Error negotiating offer: %o", e));
       })
     );
-    handle.on(
+    state.handle.on(
       "event",
       debounce(ev => {
         var jsep = ev.jsep;
         if (jsep && jsep.type == "offer") {
-          debug("Accepting new offer for handle: %o", handle);
-          var answer = conn
+          debug("Accepting new offer for handle: %o", state.handle);
+          var answer = state.conn
             .setRemoteDescription(this.configureSubscriberSdp(jsep))
-            .then(_ => conn.createAnswer())
+            .then(_ => state.conn.createAnswer())
             .then(this.fixSafariIceUFrag);
-          var local = answer.then(a => conn.setLocalDescription(a));
-          var remote = answer.then(j => handle.sendJsep(j));
+          var local = answer.then(a => state.conn.setLocalDescription(a));
+          var remote = answer.then(j => state.handle.sendJsep(j));
           return Promise.all([local, remote]).catch(e => error("Error negotiating answer: %o", e));
         } else {
           // some other kind of event, nothing to do
@@ -296,6 +305,7 @@ class JanusSession {
       }
     })*/
     if (this._publisher) {
+        dispose(this._publisher);
         if (this._publisher.conn) this._publisher.conn.close();
     }
 
@@ -487,19 +497,21 @@ class JanusSession {
 
   async createExtraPublisher(room) {
     if (!this.active) return new JanusPublisher(room);
-    var handle = new mj.JanusPluginHandle(this.session);
     // console.dir(this.peerConnectionConfig, {depth: null})
-    var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
+    const state = {
+      handle: new mj.JanusPluginHandle(this.session),
+      conn: new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG)
+    };
 
     await handle.attach("janus.plugin.sfu");
 
-    this.associate(conn, handle);
+    this.associate(state);
 
     debug("pub waiting for data channels & webrtcup");
-    var webrtcup = new Promise(resolve => handle.on("webrtcup", resolve));
+    var webrtcup = new Promise(resolve => state.handle.on("webrtcup", resolve));
 
-    var reliableChannel = conn.createDataChannel("reliable", { ordered: true });
-    var unreliableChannel = conn.createDataChannel("unreliable", {
+    var reliableChannel = state.conn.createDataChannel("reliable", { ordered: true });
+    var unreliableChannel = state.conn.createDataChannel("unreliable", {
       ordered: false,
       maxRetransmits: 0
     });
@@ -519,12 +531,12 @@ class JanusSession {
     // when janus is done in the future.
     if (this.localMediaStream) {
       this.localMediaStream.getTracks().forEach(track => {
-        conn.addTrack(track, this.localMediaStream);
+        state.conn.addTrack(track, this.localMediaStream);
       });
     }
 
     // Handle all of the join and leave events.
-    handle.on("event", ev => {
+    state.handle.on("event", ev => {
       console.log("event on new extra publisher ")
       // console.dir(ev, { depth: null});
       return
@@ -544,8 +556,8 @@ class JanusSession {
 
     debug("pub waiting for join");
 
-    room.handle = handle
-    room.conn = conn
+    room.handle = state.handle
+    room.conn = state.conn
     const publisher = new JanusPublisher(room)
 
     // Send join message to janus. Listen for join/leave messages. Automatically subscribe to all users' WebRTC data.
@@ -733,7 +745,7 @@ class JanusAdapter {
     const subscriber = await this.createUpstreamSubscriber(occupantId);
     if (subscriber) {
       if(!this.pendingOccupants.has(occupantId)) {
-        subscriber.conn.close();
+        dispose(subscriber);
       } else {
         this.pendingOccupants.delete(occupantId);
         this.occupantIds.push(occupantId);
@@ -745,7 +757,7 @@ class JanusAdapter {
         this.onOccupantConnected(occupantId);
         return true;
       }
-    }
+    } else this.pendingOccupants.delete(occupantId);
     return false;
   }
 
@@ -780,18 +792,20 @@ class JanusAdapter {
 
     await new Promise(res => this._upstream_session.listenForActive(res));
     console.log("Creating subscription for " + occupantId);
-    var handle = new mj.JanusPluginHandle(this._upstream_session.session);
-    var conn = new RTCPeerConnection(this.upstreamParams.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
+    const state = {
+      handle: new mj.JanusPluginHandle(this._upstream_session.session),
+      conn: new RTCPeerConnection(this.upstreamParams.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG)
+    };
 
     debug(occupantId + ": sub waiting for sfu");
-    await handle.attach("janus.plugin.sfu");
+    await state.handle.attach("janus.plugin.sfu");
 
-    this._upstream_session.associate(conn, handle);
+    this._upstream_session.associate(state);
 
     debug(occupantId + ": sub waiting for join");
 
     if (this.availableOccupants.indexOf(occupantId) === -1) {
-      conn.close();
+      dispose(state);
       console.warn(occupantId + ": cancelled occupant connection, occupant left after attach");
       return null;
     }
@@ -812,7 +826,7 @@ class JanusAdapter {
         resolve();
       }, SUBSCRIBE_TIMEOUT_MS);
 
-      handle.on("webrtcup", () => {
+      state.handle.on("webrtcup", () => {
         clearTimeout(timeout);
         clearInterval(leftInterval);
         resolve();
@@ -821,10 +835,10 @@ class JanusAdapter {
 
     // Send join message to janus. Don't listen for join/leave messages. Subscribe to the occupant's media.
     // Janus should send us an offer for this occupant's media in response to this.
-    await this.sendUpstreamJoin(handle, { media: occupantId });
+    await this.sendUpstreamJoin(state.handle, { media: occupantId });
 
     if (this.availableOccupants.indexOf(occupantId) === -1) {
-      conn.close();
+      dispose(state);
       console.warn(occupantId + ": cancelled occupant connection, occupant left after join");
       return null;
     }
@@ -833,13 +847,13 @@ class JanusAdapter {
     await webrtcup;
 
     if (this.availableOccupants.indexOf(occupantId) === -1) {
-      conn.close();
+      dispose(state);
       console.warn(occupantId + ": cancel occupant connection, occupant left during or after webrtcup");
       return null;
     }
 
     if (webrtcFailed) {
-      conn.close();
+      dispose(state);
       if (maxRetries > 0) {
         console.warn(occupantId + ": webrtc up timed out, retrying");
         return this.createUpstreamSubscriber(occupantId, maxRetries - 1);
@@ -857,7 +871,7 @@ class JanusAdapter {
     }
 
     var mediaStream = new MediaStream();
-    var receivers = conn.getReceivers();
+    var receivers = state.conn.getReceivers();
     receivers.forEach(receiver => {
       if (receiver.track) {
         mediaStream.addTrack(receiver.track);
@@ -868,11 +882,8 @@ class JanusAdapter {
     }
 
     debug(occupantId + ": subscriber ready");
-    return {
-      handle,
-      mediaStream,
-      conn
-    };
+    state.mediaStream = mediaStream;
+    return state;
   }
 
   sendUpstreamJoin(handle, subscribe) {
@@ -898,9 +909,10 @@ class JanusAdapter {
 
   setJoinToken(joinToken) {
     this.joinToken = joinToken;
-    Object.values(this._publishers).forEach(pub => {
+    if (NAF._stream_upstream) Object.values(this._publishers).forEach(pub => {
       pub.joinToken = joinToken
-    })
+    });
+    if (NAF._stream_jmr_downstream) this.setUpstreamJoinToken(joinToken);
   }
 
   setUpstreamJoinToken(joinToken) {
@@ -997,6 +1009,7 @@ class JanusAdapter {
     if (this.publisher) {
       // Close the publisher peer connection. Which also detaches the plugin handle.
       this.publisher.conn.close();
+      dispose(this.publisher);
       this.publisher = null;
     }
 
@@ -1159,7 +1172,7 @@ class JanusAdapter {
     const subscriber = await this.createSubscriber(occupantId);
     if (subscriber) {
       if(!this.pendingOccupants.has(occupantId)) {
-        subscriber.conn.close();
+        dispose(subscriber);
       } else {
         this.pendingOccupants.delete(occupantId);
         this.occupantIds.push(occupantId);
@@ -1170,7 +1183,7 @@ class JanusAdapter {
         // Call the Networked AFrame callbacks for the new occupant.
         this.onOccupantConnected(occupantId);
       }
-    }
+    } else this.pendingOccupants.delete(occupantId);
   }
 
   removeAllOccupants() {
@@ -1185,7 +1198,8 @@ class JanusAdapter {
     
     if (this.occupants[occupantId]) {
       // Close the subscriber peer connection. Which also detaches the plugin handle.
-      this.occupants[occupantId].conn.close();
+      // this.occupants[occupantId].conn.close();
+      dispose(this.occupants[occupantId])
       delete this.occupants[occupantId];
       
       this.occupantIds.splice(this.occupantIds.indexOf(occupantId), 1);
@@ -1206,12 +1220,12 @@ class JanusAdapter {
     this.onOccupantDisconnected(occupantId);
   }
 
-  associate(conn, handle) {
-    conn.addEventListener("icecandidate", ev => {
-      handle.sendTrickle(ev.candidate || null).catch(e => error("Error trickling ICE: %o", e));
+  associate(state) {
+    state.conn.addEventListener("icecandidate", ev => {
+      state.handle.sendTrickle(ev.candidate || null).catch(e => error("Error trickling ICE: %o", e));
     });
-    conn.addEventListener("iceconnectionstatechange", ev => {
-      if (conn.iceConnectionState === "failed") {
+    state.conn.addEventListener("iceconnectionstatechange", ev => {
+      if (state.conn.iceConnectionState === "failed") {
         console.warn("ICE failure detected. Reconnecting in 10s.");
         this.performDelayedReconnect();
       }
@@ -1221,33 +1235,33 @@ class JanusAdapter {
     // it's finished processing an existing SDP. in actuality, it seems like this is maybe
     // too liberal and we need to wait some amount of time after an offer before sending another,
     // but we don't currently know any good way of detecting exactly how long :(
-    conn.addEventListener(
+    state.conn.addEventListener(
       "negotiationneeded",
       debounce(ev => {
-        debug("Sending new offer for handle: %o", handle);
-        var offer = conn.createOffer().then(this.configurePublisherSdp).then(this.fixSafariIceUFrag);
-        var local = offer.then(o => conn.setLocalDescription(o));
+        debug("Sending new offer for handle: %o", state.handle);
+        var offer = state.conn.createOffer().then(this.configurePublisherSdp).then(this.fixSafariIceUFrag);
+        var local = offer.then(o => state.conn.setLocalDescription(o));
         var remote = offer;
 
         remote = remote
           .then(this.fixSafariIceUFrag)
-          .then(j => handle.sendJsep(j))
-          .then(r => conn.setRemoteDescription(r.jsep));
+          .then(j => state.handle.sendJsep(j))
+          .then(r => state.conn.setRemoteDescription(r.jsep));
         return Promise.all([local, remote]).catch(e => error("Error negotiating offer: %o", e));
       })
     );
-    handle.on(
+    state.handle.on(
       "event",
       debounce(ev => {
         var jsep = ev.jsep;
         if (jsep && jsep.type == "offer") {
-          debug("Accepting new offer for handle: %o", handle);
-          var answer = conn
+          debug("Accepting new offer for handle: %o", state.handle);
+          var answer = state.conn
             .setRemoteDescription(this.configureSubscriberSdp(jsep))
-            .then(_ => conn.createAnswer())
+            .then(_ => state.conn.createAnswer())
             .then(this.fixSafariIceUFrag);
-          var local = answer.then(a => conn.setLocalDescription(a));
-          var remote = answer.then(j => handle.sendJsep(j));
+          var local = answer.then(a => state.conn.setLocalDescription(a));
+          var remote = answer.then(j => state.handle.sendJsep(j));
           return Promise.all([local, remote]).catch(e => error("Error negotiating answer: %o", e));
         } else {
           // some other kind of event, nothing to do
@@ -1258,21 +1272,23 @@ class JanusAdapter {
   }
 
   async createPublisher() {
-    var handle = new mj.JanusPluginHandle(this.session);
-    var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
+    const state = {
+      handle: new mj.JanusPluginHandle(this.session),
+      conn: new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG)
+    };
 
     debug("pub waiting for sfu");
-    await handle.attach("janus.plugin.sfu");
+    await state.handle.attach("janus.plugin.sfu");
 
-    this.associate(conn, handle);
+    this.associate(state);
 
     debug("pub waiting for data channels & webrtcup");
-    var webrtcup = new Promise(resolve => handle.on("webrtcup", resolve));
+    var webrtcup = new Promise(resolve => state.handle.on("webrtcup", resolve));
 
     // Unreliable datachannel: sending and receiving component updates.
     // Reliable datachannel: sending and recieving entity instantiations.
-    var reliableChannel = conn.createDataChannel("reliable", { ordered: true });
-    var unreliableChannel = conn.createDataChannel("unreliable", {
+    var reliableChannel = state.conn.createDataChannel("reliable", { ordered: true });
+    var unreliableChannel = state.conn.createDataChannel("unreliable", {
       ordered: false,
       maxRetransmits: 0
     });
@@ -1291,12 +1307,12 @@ class JanusAdapter {
     // when janus is done in the future.
     if (this.localMediaStream) {
       this.localMediaStream.getTracks().forEach(track => {
-        conn.addTrack(track, this.localMediaStream);
+        state.conn.addTrack(track, this.localMediaStream);
       });
     }
 
     // Handle all of the join and leave events.
-    handle.on("event", ev => {
+    state.handle.on("event", ev => {
       var data = ev.plugindata.data;
       if (data.event == "join" && data.room_id == this.room) {
         this.addAvailableOccupant(data.user_id);
@@ -1316,7 +1332,7 @@ class JanusAdapter {
     debug("pub waiting for join");
 
     // Send join message to janus. Listen for join/leave messages. Automatically subscribe to all users' WebRTC data.
-    var message = await this.sendJoin(handle, {
+    var message = await this.sendJoin(state.handle, {
       notifications: true,
       data: true
     });
@@ -1336,11 +1352,11 @@ class JanusAdapter {
 
     debug("publisher ready");
     return {
-      handle,
+      handle: state.handle,
       initialOccupants,
       reliableChannel,
       unreliableChannel,
-      conn
+      conn: state.conn
     };
   }
 
@@ -1388,18 +1404,20 @@ class JanusAdapter {
       return null;
     }
 
-    var handle = new mj.JanusPluginHandle(this.session);
-    var conn = new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG);
+    const state = {
+      handle: new mj.JanusPluginHandle(this.session),
+      conn: new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG)
+    };
 
     debug(occupantId + ": sub waiting for sfu");
-    await handle.attach("janus.plugin.sfu");
+    await state.handle.attach("janus.plugin.sfu");
 
-    this.associate(conn, handle);
+    this.associate(state);
 
     debug(occupantId + ": sub waiting for join");
 
     if (this.availableOccupants.indexOf(occupantId) === -1) {
-      conn.close();
+      dispose(state);
       console.warn(occupantId + ": cancelled occupant connection, occupant left after attach");
       return null;
     }
@@ -1420,7 +1438,7 @@ class JanusAdapter {
         resolve();
       }, SUBSCRIBE_TIMEOUT_MS);
 
-      handle.on("webrtcup", () => {
+      state.handle.on("webrtcup", () => {
         clearTimeout(timeout);
         clearInterval(leftInterval);
         resolve();
@@ -1429,10 +1447,10 @@ class JanusAdapter {
 
     // Send join message to janus. Don't listen for join/leave messages. Subscribe to the occupant's media.
     // Janus should send us an offer for this occupant's media in response to this.
-    await this.sendJoin(handle, { media: occupantId });
+    await this.sendJoin(state.handle, { media: occupantId });
 
     if (this.availableOccupants.indexOf(occupantId) === -1) {
-      conn.close();
+      dispose(state);
       console.warn(occupantId + ": cancelled occupant connection, occupant left after join");
       return null;
     }
@@ -1441,13 +1459,13 @@ class JanusAdapter {
     await webrtcup;
 
     if (this.availableOccupants.indexOf(occupantId) === -1) {
-      conn.close();
+      dispose(state);
       console.warn(occupantId + ": cancel occupant connection, occupant left during or after webrtcup");
       return null;
     }
 
     if (webrtcFailed) {
-      conn.close();
+      dispose(state);
       if (maxRetries > 0) {
         console.warn(occupantId + ": webrtc up timed out, retrying");
         return this.createSubscriber(occupantId, maxRetries - 1);
@@ -1465,7 +1483,7 @@ class JanusAdapter {
     }
 
     var mediaStream = new MediaStream();
-    var receivers = conn.getReceivers();
+    var receivers = state.conn.getReceivers();
     receivers.forEach(receiver => {
       if (receiver.track) {
         mediaStream.addTrack(receiver.track);
@@ -1476,11 +1494,8 @@ class JanusAdapter {
     }
 
     debug(occupantId + ": subscriber ready");
-    return {
-      handle,
-      mediaStream,
-      conn
-    };
+    state.mediaStream = mediaStream;
+    return state;
   }
 
   sendJoin(handle, subscribe) {
