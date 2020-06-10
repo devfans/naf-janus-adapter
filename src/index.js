@@ -503,7 +503,7 @@ class JanusSession {
       conn: new RTCPeerConnection(this.peerConnectionConfig || DEFAULT_PEER_CONNECTION_CONFIG)
     };
 
-    await handle.attach("janus.plugin.sfu");
+    await state.handle.attach("janus.plugin.sfu");
 
     this.associate(state);
 
@@ -647,11 +647,52 @@ class JanusAdapter {
     this.mainRooms = []
     this.extraRooms = {}
     this.upstreamParams = {}
+    this.guest = null;
+    this._upstream_publisher = null;
+    this._upstream_session_ready = false;
 
-    if (NAF._solution == 2) window.addEventListener('guestspeaker_update', this.updateSpeakerSource.bind(this));
+    if (NAF._stream_jmr) window.addEventListener('guestspeaker_update', this.updateGuestSpeaker.bind(this));
   }
 
-  updateSpeakerSource () {
+  updateGuestSpeaker() {
+    // Add or Remove publisher on upstream room
+    if (NAF._is_guest) {
+      console.log("Promoting as guest speaker in progress");
+      if (!this._upstream_session_ready) {
+        console.log("Upstream session not ready yet, waiting...");
+        setTimeout(this.updateGuestSpeaker.bind(this), 2000);
+        return;
+      }
+      if (!this._upstream_session._publisher) {
+        console.log("Establishing upstream publisher");
+        const room =  {};
+        Object.assign(room, this.upstreamParams);
+        room.webRtcOptions = this.webRtcOptions
+        room.localMediaStream = this.localMediaStream
+        this._upstream_session._publisher = {};
+        this._upstream_session._publisher = this._upstream_session.createExtraPublisher(room);
+        this._upstream_publisher = this._upstream_session._publisher;
+      }
+    } else if (this._upstream_session_ready) {
+      console.log("Destroying upstream publisher");
+      if (this._upstream_session._publisher) dispose(this._upstream_session._publisher);
+      if (this._upstream_publisher) dispose(this._upstream_publisher);
+      this._upstream_session._publisher = null;
+      this._upstream_publisher = null;
+    }
+
+    const guest = NAF._guest.id;
+    if (this.guest == guest) return;
+    const oldGuest = this.guest;
+    if (oldGuest) {
+      this.removeAvailableOccupant(oldGuest);
+      this.removeOccupant(oldGuest);
+    }
+    if (guest) {
+      this.addAvailableOccupant(guest);
+    }
+    this.guest = guest;
+    this.syncOccupants();
   }
 
   async setExtraRooms() {
@@ -917,6 +958,9 @@ class JanusAdapter {
 
   setUpstreamJoinToken(joinToken) {
     this.upstreamParams.joinToken = joinToken;
+    if (this._upstream_publisher) {
+      this._upstream_publisher.joinToken = joinToken;
+    }
   }
 
   setClientId(clientId) {
@@ -924,6 +968,10 @@ class JanusAdapter {
     Object.values(this._publishers).forEach(pub => {
       pub.clientId = clientId
     })
+
+    if (this._upstream_publisher) {
+      this._upstream_publisher.clientId = clientId
+    }
   }
 
   setWebRtcOptions(options) {
@@ -1131,13 +1179,16 @@ class JanusAdapter {
     if (requestedOccupants) {
       this.requestedOccupants = requestedOccupants;
     }
+    const occupants = new Set(this.requestedOccupants || [])
+
     const checkUpstream = NAF._stream_jmr_downstream;
     let upstreamOccupants = new Set;
     if (checkUpstream) {
       upstreamOccupants = new Set(Object.values(NAF._sess).filter(k=>k));
       upstreamOccupants.forEach(o => this.addAvailableOccupant(o));
+    } else if (NAF._stream_jmr_upstream && NAF._sess.guest) {
+      occupants.add(NAF._sess.guest);
     }
-    const occupants = new Set(this.requestedOccupants || [])
     upstreamOccupants.forEach(o => occupants.add(o));
 
     // Add any requested, available, and non-pending occupants.
@@ -1794,6 +1845,7 @@ class JanusAdapter {
     this.localMediaStream = stream;
     this.setMediaStream(this.clientId, stream);
     Object.values(this._sessions).forEach(sess => sess.setLocalMediaStream(stream))
+    if (this._upstream_session) this._upstream_session.setLocalMediaStream(stream)
   }
 
   enableMicrophone(enabled) {
